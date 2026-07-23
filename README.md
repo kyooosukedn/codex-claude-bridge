@@ -7,7 +7,7 @@ It wraps [`claude-code-tmux`](https://www.npmjs.com/package/claude-code-tmux), w
 ## Install
 
 ```bash
-npm install -g codex-claude-bridge
+npm install -g github:kyooosukedn/codex-claude-bridge
 pi install npm:claude-code-tmux
 ```
 
