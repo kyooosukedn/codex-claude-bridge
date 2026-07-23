@@ -34,16 +34,49 @@ ccb send --session auth-fix "Continue. Now run the focused tests."
 ccb capture --session auth-fix
 ```
 
+## Full Control
+
+`send` is best when Codex wants a structured job result. It adds a completion protocol and waits:
+
+```bash
+ccb send --session auth-fix --cwd C:\repo\app --timeout-ms 180000 "Fix the failing auth test."
+```
+
+Use raw terminal controls when Codex needs to act like a human inside Claude Code:
+
+```bash
+ccb type --session auth-fix --enter "Continue, but do not edit files yet."
+ccb slash --session auth-fix "/cost"
+ccb choose --session auth-fix 1
+ccb key --session auth-fix Tab Enter
+ccb interrupt --session auth-fix
+ccb capture --session auth-fix --lines 160
+ccb wait-ready --session auth-fix
+```
+
+The same `--session` always targets the same tmux-backed Claude Code process.
+
 ## Commands
 
 ```text
 ccb doctor [--json]
 ccb patch-ccmux-windows
-ccb start [--session NAME] [--cwd DIR]
-ccb send [--session NAME] [--cwd DIR] [--timeout-ms MS] "prompt"
+ccb start [--session NAME] [--cwd DIR] [--model MODEL] [--effort LEVEL] [--safe-permissions]
+ccb send [--session NAME] [--cwd DIR] [--timeout-ms MS] [--startup-wait-ms MS] "prompt"
+ccb type [--session NAME] [--enter] "raw message"
+ccb slash [--session NAME] "command"
 ccb steer [--session NAME] "message"
+ccb key [--session NAME] KEY [KEY...]
+ccb choose [--session NAME] NUMBER
+ccb enter [--session NAME]
+ccb escape [--session NAME]
+ccb interrupt [--session NAME]
 ccb capture [--session NAME] [--lines N]
+ccb wait-ready [--session NAME] [--timeout-ms MS]
 ccb status
+ccb sessions
+ccb jobs
+ccb attach [--session NAME]
 ccb kill [--session NAME]
 ```
 

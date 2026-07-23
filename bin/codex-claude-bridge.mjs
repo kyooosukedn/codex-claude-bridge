@@ -1,13 +1,27 @@
 #!/usr/bin/env node
+import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 const DEFAULT_SESSION = "codex-claude";
 const DEFAULT_TIMEOUT_MS = 180000;
 const DEFAULT_STARTUP_WAIT_MS = 12000;
+const DEFAULT_READY_TIMEOUT_MS = 45000;
 const MSYS_BIN = "C:\\msys64\\usr\\bin";
+const BOOLEAN_FLAGS = new Set([
+  "enter",
+  "json",
+  "remote-control",
+  "safe-permissions",
+]);
 
 function printHelp() {
   console.log(`codex-claude-bridge
@@ -15,11 +29,25 @@ function printHelp() {
 Usage:
   ccb doctor [--json]
   ccb patch-ccmux-windows
-  ccb start [--session NAME] [--cwd DIR]
+
+  ccb start [--session NAME] [--cwd DIR] [--model MODEL] [--effort LEVEL] [--safe-permissions]
   ccb send [--session NAME] [--cwd DIR] [--timeout-ms MS] [--startup-wait-ms MS] "prompt"
+  ccb type [--session NAME] [--enter] "raw message"
+  ccb slash [--session NAME] "command"
   ccb steer [--session NAME] "message"
+
+  ccb key [--session NAME] KEY [KEY...]
+  ccb choose [--session NAME] NUMBER
+  ccb enter [--session NAME]
+  ccb escape [--session NAME]
+  ccb interrupt [--session NAME]
+
   ccb capture [--session NAME] [--lines N]
+  ccb wait-ready [--session NAME] [--timeout-ms MS]
   ccb status
+  ccb sessions
+  ccb jobs
+  ccb attach [--session NAME]
   ccb kill [--session NAME]
 
 Defaults:
@@ -41,11 +69,8 @@ function parse(argv) {
       continue;
     }
     const key = item.slice(2);
-    if (!args.length || args[0].startsWith("--")) {
-      opts[key] = true;
-    } else {
-      opts[key] = args.shift();
-    }
+    if (BOOLEAN_FLAGS.has(key) || !args.length || args[0].startsWith("--")) opts[key] = true;
+    else opts[key] = args.shift();
   }
   return { command, opts };
 }
@@ -53,23 +78,23 @@ function parse(argv) {
 function envWithTmux() {
   const env = { ...process.env };
   if (process.platform === "win32" && existsSync(path.join(MSYS_BIN, "tmux.exe"))) {
-    const parts = String(env.Path || env.PATH || "").split(";");
+    const currentPath = String(env.Path || env.PATH || "");
+    const parts = currentPath.split(";");
     if (!parts.some((p) => p.toLowerCase() === MSYS_BIN.toLowerCase())) {
-      env.Path = `${MSYS_BIN};${env.Path || env.PATH || ""}`;
+      env.Path = `${MSYS_BIN};${currentPath}`;
     }
   }
   return env;
 }
 
 function run(command, args = [], options = {}) {
-  const result = spawnSync(command, args, {
+  return spawnSync(command, args, {
     cwd: options.cwd,
     env: envWithTmux(),
     encoding: "utf8",
     shell: process.platform === "win32",
     stdio: options.stdio || "pipe",
   });
-  return result;
 }
 
 function must(command, args = [], options = {}) {
@@ -81,6 +106,10 @@ function must(command, args = [], options = {}) {
   return result.stdout || "";
 }
 
+function sleep(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 function commandOk(command, args = ["--version"]) {
   const result = run(command, args);
   return {
@@ -90,34 +119,113 @@ function commandOk(command, args = ["--version"]) {
   };
 }
 
-function sleep(ms) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+function safeName(value) {
+  const cleaned = String(value || "default")
+    .trim()
+    .replace(/[^a-zA-Z0-9_.-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+  return cleaned || "default";
+}
+
+function tmuxSessionName(session) {
+  return `ccmux-${safeName(session)}`;
+}
+
+function msysPathForShell(value) {
+  const text = String(value);
+  const match = text.match(/^([a-zA-Z]):[\\/](.*)$/);
+  if (!match) return text;
+  return `/${match[1].toLowerCase()}/${match[2].replace(/\\/g, "/")}`;
 }
 
 function ccmuxStatus() {
-  const text = must("ccmux", ["status"]);
-  return JSON.parse(text);
+  return JSON.parse(must("ccmux", ["status"]));
+}
+
+function sessionInfo(name) {
+  const status = ccmuxStatus();
+  return status.sessions?.find((s) => s.name === name) || null;
 }
 
 function sessionAlive(name) {
   try {
-    const status = ccmuxStatus();
-    return Boolean(status.sessions?.find((s) => s.name === name && s.alive));
+    return Boolean(sessionInfo(name)?.alive);
   } catch {
     return false;
   }
 }
 
-function startSession({ session, cwd }) {
+function startSession({ session, cwd, opts }) {
   const args = ["start", "--name", session, "--cwd", cwd, "--no-agents-md"];
+  if (opts.model) args.push("--model", String(opts.model));
+  if (opts.effort) args.push("--effort", String(opts.effort));
+  if (opts["remote-control"]) args.push("--remote-control");
+  if (opts["safe-permissions"]) args.push("--safe-permissions");
   return must("ccmux", args);
 }
 
-function ensureSession({ session, cwd, startupWaitMs }) {
+function ensureSession({ session, cwd, opts, startupWaitMs }) {
   if (!sessionAlive(session)) {
-    startSession({ session, cwd });
+    startSession({ session, cwd, opts });
     sleep(startupWaitMs);
   }
+}
+
+function captureSession(session, lines = 120) {
+  return must("ccmux", ["capture", "--session", session, "--lines", String(lines)]);
+}
+
+function waitReady(session, timeoutMs = DEFAULT_READY_TIMEOUT_MS) {
+  const start = Date.now();
+  let last = "";
+  while (Date.now() - start < timeoutMs) {
+    last = captureSession(session, 80);
+    const clean = stripAnsi(last);
+    if (
+      clean.includes(">") ||
+      clean.includes("Press up edit queued messages") ||
+      clean.includes("bypass permissions on")
+    ) {
+      return { ready: true, session, waitedMs: Date.now() - start };
+    }
+    sleep(1000);
+  }
+  return { ready: false, session, waitedMs: Date.now() - start, tail: last };
+}
+
+function stripAnsi(text) {
+  return String(text).replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "");
+}
+
+function tmux(args, options = {}) {
+  return must("tmux", args, options);
+}
+
+function key(session, keys) {
+  const target = tmuxSessionName(session);
+  tmux(["send-keys", "-t", target, ...keys]);
+  return { session, tmuxSession: target, keys };
+}
+
+function enterText(session, text, enter = true) {
+  const target = tmuxSessionName(session);
+  const tmpDir = path.join(os.tmpdir(), "codex-claude-bridge");
+  mkdirSync(tmpDir, { recursive: true });
+  const file = path.join(tmpDir, `${randomUUID()}.txt`);
+  writeFileSync(file, text);
+  try {
+    tmux(["load-buffer", msysPathForShell(file)]);
+    tmux(["paste-buffer", "-p", "-t", target]);
+    if (enter) tmux(["send-keys", "-t", target, "Enter"]);
+  } finally {
+    try {
+      unlinkSync(file);
+    } catch {
+      // Best effort cleanup.
+    }
+  }
+  return { session, tmuxSession: target, entered: enter, bytes: Buffer.byteLength(text) };
 }
 
 function findGlobalCcmuxCore() {
@@ -187,10 +295,7 @@ export function msysPathForShell(value) {
   return command;`,
   );
 
-  if (src !== original) {
-    writeFileSync(file, src);
-  }
-
+  if (src !== original) writeFileSync(file, src);
   return { changed: src !== original, file };
 }
 
@@ -215,7 +320,7 @@ function doctor(json = false) {
 
 async function main() {
   const { command, opts } = parse(process.argv.slice(2));
-  const session = String(opts.session || opts.name || DEFAULT_SESSION);
+  const session = safeName(opts.session || opts.name || DEFAULT_SESSION);
   const cwd = path.resolve(String(opts.cwd || process.cwd()));
 
   if (command === "help") return printHelp();
@@ -228,8 +333,16 @@ async function main() {
     process.stdout.write(must("ccmux", ["status"]));
     return;
   }
+  if (command === "sessions") {
+    console.log(JSON.stringify(ccmuxStatus().sessions || [], null, 2));
+    return;
+  }
+  if (command === "jobs") {
+    process.stdout.write(must("ccmux", ["jobs"]));
+    return;
+  }
   if (command === "start") {
-    process.stdout.write(startSession({ session, cwd }));
+    process.stdout.write(startSession({ session, cwd, opts }));
     return;
   }
   if (command === "send") {
@@ -238,6 +351,7 @@ async function main() {
     ensureSession({
       session,
       cwd,
+      opts,
       startupWaitMs: Number(opts["startup-wait-ms"] || DEFAULT_STARTUP_WAIT_MS),
     });
     const timeout = String(opts["timeout-ms"] || DEFAULT_TIMEOUT_MS);
@@ -247,15 +361,58 @@ async function main() {
     process.stdout.write(must("ccmux", args));
     return;
   }
+  if (command === "type") {
+    const text = opts._.join(" ");
+    if (!text) throw new Error("type requires text");
+    console.log(JSON.stringify(enterText(session, text, Boolean(opts.enter)), null, 2));
+    return;
+  }
+  if (command === "slash") {
+    const slash = opts._.join(" ").trim();
+    if (!slash) throw new Error("slash requires command");
+    const text = slash.startsWith("/") ? slash : `/${slash}`;
+    console.log(JSON.stringify(enterText(session, text, true), null, 2));
+    return;
+  }
   if (command === "steer") {
     const message = opts._.join(" ").trim();
     if (!message) throw new Error("steer requires message");
     process.stdout.write(must("ccmux", ["steer", "--session", session, message]));
     return;
   }
+  if (command === "key") {
+    if (!opts._.length) throw new Error("key requires one or more tmux key names");
+    console.log(JSON.stringify(key(session, opts._), null, 2));
+    return;
+  }
+  if (command === "choose") {
+    const choice = opts._[0];
+    if (!choice) throw new Error("choose requires number");
+    console.log(JSON.stringify(key(session, [String(choice), "Enter"]), null, 2));
+    return;
+  }
+  if (command === "enter") {
+    console.log(JSON.stringify(key(session, ["Enter"]), null, 2));
+    return;
+  }
+  if (command === "escape") {
+    console.log(JSON.stringify(key(session, ["Escape"]), null, 2));
+    return;
+  }
+  if (command === "interrupt") {
+    console.log(JSON.stringify(key(session, ["C-c"]), null, 2));
+    return;
+  }
   if (command === "capture") {
-    const lines = String(opts.lines || 120);
-    process.stdout.write(must("ccmux", ["capture", "--session", session, "--lines", lines]));
+    process.stdout.write(captureSession(session, opts.lines || 120));
+    return;
+  }
+  if (command === "wait-ready") {
+    console.log(JSON.stringify(waitReady(session, Number(opts["timeout-ms"] || DEFAULT_READY_TIMEOUT_MS)), null, 2));
+    return;
+  }
+  if (command === "attach") {
+    run("ccmux", ["attach", "--session", session], { stdio: "inherit" });
     return;
   }
   if (command === "kill") {
