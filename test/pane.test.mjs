@@ -30,6 +30,7 @@ import {
   UNNUMBERED_MENU_NO_CURSOR_PANE,
   HISTORICAL_SPINNER_WITH_PERMISSION_PANE,
   HISTORICAL_SPINNER_WITH_YESNO_PANE,
+  NUMBERED_PROSE_IDLE_PANE,
 } from "./fixtures.mjs";
 
 test("stripAnsi removes CSI sequences", () => {
@@ -382,4 +383,24 @@ test("regression: thinking still outranks crashed when hook errors present", () 
   // Reorder must not regress the earlier hook-error fix.
   const r = classifyPane(HOOK_ERRORS_THINKING_PANE);
   assert.equal(r.state, "thinking");
+});
+
+test("regression: numbered prose near bottom does NOT become needs_input", () => {
+  // Dogfood: steering prose containing items 11/12/13 was misextracted as a
+  // 3-option menu and classified as needs_input. Real Claude menus always
+  // render a ❯ cursor on the selected option; static numbered prose does not.
+  // Must classify as idle here (footer + empty prompt present), and the
+  // classifier must decline to populate result.options.
+  const r = classifyPane(NUMBERED_PROSE_IDLE_PANE);
+  assert.equal(
+    r.state,
+    "idle",
+    `expected idle, got ${r.state} (${JSON.stringify(r.evidence)})`,
+  );
+  assert.equal(r.options, null, "numbered prose without cursor must not produce options");
+  assert.equal(r.evidence.optionsWithoutCursor, 3);
+  assert.equal(r.evidence.selectionCursor, undefined);
+  // Contract: resolvePromptAction refuses unless state is permission_prompt
+  // or needs_input. Since this pane classifies as idle, approve/deny would
+  // refuse with exit code 2 by design — no pure-function assertion needed.
 });

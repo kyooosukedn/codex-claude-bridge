@@ -4,6 +4,24 @@ Tiny CLI bridge for Codex to control persistent Claude Code sessions without usi
 
 It wraps [`claude-code-tmux`](https://www.npmjs.com/package/claude-code-tmux), which drives the real interactive `claude` CLI inside `tmux`. Sessions persist, Codex can send follow-up prompts, and work can continue without losing Claude Code context.
 
+## How it works
+
+`ccb` is a stateless Node CLI. Every invocation shells out to `ccmux` (for session management, sends, and captures) or `tmux` directly (for raw keystrokes, typed text via `paste-buffer`, and multiline-safe steering). It never speaks to the Anthropic API. Authentication, subscription or usage billing, model selection, and safety policy remain entirely controlled by Claude Code and your Anthropic account configuration.
+
+The classifier reads `ccmux capture` output, strips ANSI, and matches conservative signals for `idle`, `thinking`, `needs_input`, `permission_prompt`, `done`, `crashed`, or `unknown`. When evidence is weak, it returns `unknown` rather than guessing.
+
+## Documentation
+
+- [ARCHITECTURE.md](./docs/ARCHITECTURE.md) — end-to-end mechanism, command taxonomy, classifier precedence, multiline steer implementation, Windows patch.
+- [RELIABILITY.md](./docs/RELIABILITY.md) — honest maturity assessment, what is and is not tested, known limitations, failure modes, suggested next tests.
+- [OPERATIONS.md](./docs/OPERATIONS.md) — install/upgrade, multi-chat sessions, orchestration loop, recovery runbook, troubleshooting, cleanup.
+
+## Maturity
+
+**Early. Usable for careful, supervised automation. Not yet production-grade.**
+
+The core read paths (capture, classify `idle`/`thinking`/`done`, multiline `steer`, refusal on non-prompt states) are covered by automated tests and by live smoke against real `tmux` sessions on Windows. The riskier paths — real Claude Code permission popups, crash recovery, and non-Windows platforms — are covered by synthetic fixtures only and have never been exercised end-to-end with this bridge. Treat it the way you would treat any terminal automation tool: useful for the loops it handles, but not something to leave running unattended against a session you care about until you have verified your specific usage on your platform. See [RELIABILITY.md](./docs/RELIABILITY.md) for the full test matrix and confidence labels.
+
 ## Install
 
 ```bash

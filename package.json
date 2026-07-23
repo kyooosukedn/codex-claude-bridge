@@ -27,6 +27,7 @@
     "bin/",
     "lib/",
     "test/",
+    "docs/",
     "README.md",
     "LICENSE"
   ]

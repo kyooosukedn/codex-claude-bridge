@@ -266,3 +266,26 @@ export const HISTORICAL_SPINNER_WITH_YESNO_PANE = `
   ⏵⏵ bypass permissions on (shift+tab to cycle)
 `;
 
+// Numbered prose from a steering message rendered near the bottom of the
+// pane. The footer and empty `>` prompt are intact — Claude is idle, NOT
+// waiting for a menu. Without the cursor-required rule, items 11–13 would
+// be misextracted as a 3-option cluster and flip the state to needs_input.
+// Discovered via dogfood during docs work.
+export const NUMBERED_PROSE_IDLE_PANE = `
+  ⎿  Updated docs/ARCHITECTURE.md
+
+● Done. Summary of corrections:
+
+  11. Replaced every ~/.ccmux reference with ~/.pi/ccmux/state.json.
+  12. Corrected safeName to preserve case (letters, digits, _, ., -).
+  13. Swapped claude-opus-4-7 for the opus pass-through alias.
+
+✻ Baked for 28s
+
+─────────────────────────────────────────────────────────────────── ccb-smoke ──
+>
+────────────────────────────────────────────────────────────────────────────────
+  glm-5.2 │ work ░░░░░░░░░░ 6%
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+`;
+
