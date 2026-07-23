@@ -1,0 +1,30 @@
+{
+  "name": "codex-claude-bridge",
+  "version": "0.1.0",
+  "description": "Tiny CLI bridge for Codex to control persistent Claude Code sessions through ccmux/tmux.",
+  "type": "module",
+  "bin": {
+    "codex-claude-bridge": "./bin/codex-claude-bridge.mjs",
+    "ccb": "./bin/codex-claude-bridge.mjs"
+  },
+  "scripts": {
+    "check": "node ./bin/codex-claude-bridge.mjs --help && node ./bin/codex-claude-bridge.mjs doctor --json"
+  },
+  "keywords": [
+    "codex",
+    "claude-code",
+    "ccmux",
+    "tmux",
+    "agent",
+    "orchestration"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin/",
+    "README.md",
+    "LICENSE"
+  ]
+}
