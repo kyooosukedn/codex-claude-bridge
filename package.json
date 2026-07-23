@@ -8,7 +8,8 @@
     "ccb": "./bin/codex-claude-bridge.mjs"
   },
   "scripts": {
-    "check": "node ./bin/codex-claude-bridge.mjs --help && node ./bin/codex-claude-bridge.mjs doctor --json"
+    "test": "node --test test/pane.test.mjs",
+    "check": "node --test test/pane.test.mjs && node ./bin/codex-claude-bridge.mjs --help && node ./bin/codex-claude-bridge.mjs doctor --json"
   },
   "keywords": [
     "codex",
@@ -24,6 +25,8 @@
   },
   "files": [
     "bin/",
+    "lib/",
+    "test/",
     "README.md",
     "LICENSE"
   ]

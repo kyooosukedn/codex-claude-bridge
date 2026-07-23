@@ -10,11 +10,21 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  classifyPane,
+  selectOption,
+  stripAnsi as stripAnsiLib,
+} from "../lib/pane.mjs";
+import { buildSteerPayload, countLines } from "../lib/steer.mjs";
 
 const DEFAULT_SESSION = "codex-claude";
 const DEFAULT_TIMEOUT_MS = 180000;
 const DEFAULT_STARTUP_WAIT_MS = 12000;
 const DEFAULT_READY_TIMEOUT_MS = 45000;
+const DEFAULT_INSPECT_LINES = 120;
+const DEFAULT_WATCH_INTERVAL_MS = 1500;
+const DEFAULT_WATCH_TIMEOUT_MS = 600000;
 const MSYS_BIN = "C:\\msys64\\usr\\bin";
 const BOOLEAN_FLAGS = new Set([
   "enter",
@@ -22,6 +32,26 @@ const BOOLEAN_FLAGS = new Set([
   "remote-control",
   "safe-permissions",
 ]);
+
+function stripAnsi(text) {
+  return stripAnsiLib(text);
+}
+
+function dieUsage(message) {
+  console.error(`ccb: ${message}`);
+  process.exit(2);
+}
+
+function parsePositiveInt(raw, fallback, name) {
+  if (raw === undefined || raw === "" || raw === null) return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+    dieUsage(
+      `--${name} must be a positive integer, got: ${JSON.stringify(raw)}`,
+    );
+  }
+  return n;
+}
 
 function printHelp() {
   console.log(`codex-claude-bridge
@@ -35,6 +65,20 @@ Usage:
   ccb type [--session NAME] [--enter] "raw message"
   ccb slash [--session NAME] "command"
   ccb steer [--session NAME] "message"
+
+  ccb inspect [--session NAME] [--lines N] [--json]
+    Classify the live Claude Code pane state.
+    States: idle | thinking | needs_input | permission_prompt | done | crashed | unknown
+
+  ccb approve [--session NAME] [--lines N] [--json]
+  ccb deny   [--session NAME] [--lines N] [--json]
+    Inspect first; pick the semantically correct option (yes/allow/proceed or no/deny/cancel).
+    Refuses with nonzero exit when there is no permission/input prompt.
+    Falls back to y/n when the prompt has no numbered options.
+
+  ccb watch [--session NAME] [--interval-ms MS] [--lines N] [--json] [--timeout-ms MS]
+    Poll the pane and emit only state transitions (JSON Lines when --json).
+    Stops on done/crashed, timeout, or Ctrl+C.
 
   ccb key [--session NAME] KEY [KEY...]
   ccb choose [--session NAME] NUMBER
@@ -53,6 +97,13 @@ Usage:
 Defaults:
   session: ${DEFAULT_SESSION}
   cwd: current directory
+  inspect lines: ${DEFAULT_INSPECT_LINES}
+  watch interval: ${DEFAULT_WATCH_INTERVAL_MS}ms, timeout: ${DEFAULT_WATCH_TIMEOUT_MS}ms
+
+Notes:
+  - inspect and watch only read the pane; safe to run against a live session.
+  - approve/deny/choose send keystrokes; they can mutate the target session.
+  - Use \`ccb choose N\` as a raw escape hatch when approve/deny cannot resolve an option.
 `);
 }
 
@@ -194,8 +245,284 @@ function waitReady(session, timeoutMs = DEFAULT_READY_TIMEOUT_MS) {
   return { ready: false, session, waitedMs: Date.now() - start, tail: last };
 }
 
-function stripAnsi(text) {
-  return String(text).replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "");
+function inspectSession(session, lines, json) {
+  const raw = captureSession(session, lines);
+  const result = classifyPane(raw, {
+    tailLines: Math.min(lines, 200),
+    excerptLines: 24,
+  });
+  const summary = {
+    session,
+    state: result.state,
+    prompt: result.prompt,
+    options: result.options,
+    spinner: result.spinner,
+    doneMarker: result.doneMarker,
+    excerpt: result.excerpt,
+    evidence: result.evidence,
+  };
+  if (json) {
+    process.stdout.write(JSON.stringify(summary) + "\n");
+    return summary;
+  }
+  const out = [`session: ${summary.session}`, `state:   ${summary.state}`];
+  if (summary.prompt) out.push(`prompt:  ${summary.prompt}`);
+  if (summary.options && summary.options.length) {
+    out.push("options:");
+    for (const opt of summary.options) {
+      const sel = opt.selected ? ">" : " ";
+      const num = opt.number ? `${opt.number}.` : " ";
+      out.push(`  ${sel} ${num} ${opt.label}`);
+    }
+  }
+  if (summary.spinner) {
+    out.push(`spinner: ${summary.spinner.label} (${summary.spinner.detail})`);
+  }
+  if (summary.doneMarker) out.push(`done:    ${summary.doneMarker}`);
+  out.push("", "-- excerpt --", summary.excerpt);
+  console.log(out.join("\n"));
+  return summary;
+}
+
+// Resolves approve/deny against the live pane. Returns { ok, code, payload, result }.
+// Refuses with nonzero exit code when there is no permission/input prompt.
+// Numbered menus: send `<number>` Enter.
+// Unnumbered cursor menus: navigate from the single selected option via Up/Down,
+//   then Enter. Refuses when no selection, ambiguous selection, or no label match.
+function resolvePromptAction(session, lines, intent) {
+  const raw = captureSession(session, lines);
+  const result = classifyPane(raw, {
+    tailLines: Math.min(lines, 200),
+    excerptLines: 24,
+  });
+  const isPromptState =
+    result.state === "permission_prompt" || result.state === "needs_input";
+  if (!isPromptState) {
+    return {
+      ok: false,
+      code: 2,
+      result,
+      payload: {
+        error: "no prompt",
+        session,
+        state: result.state,
+        hint: "ccb.approve/deny only act on permission_prompt or needs_input states",
+      },
+    };
+  }
+
+  // Inline y/n style prompt with no numbered options.
+  if (!result.options || result.options.length === 0) {
+    const answer = intent === "deny" ? "n" : "y";
+    key(session, [answer, "Enter"]);
+    return {
+      ok: true,
+      code: 0,
+      result,
+      payload: {
+        session,
+        intent,
+        via: "inline-yn",
+        answer,
+        prompt: result.prompt,
+      },
+    };
+  }
+
+  const pick = selectOption(result.options, intent);
+  if (!pick) {
+    return {
+      ok: false,
+      code: 3,
+      result,
+      payload: {
+        error: "no matching option",
+        session,
+        state: result.state,
+        intent,
+        options: result.options,
+        prompt: result.prompt,
+        hint: "Use `ccb choose N` to select an option position directly",
+      },
+    };
+  }
+
+  // Numbered menu: send the number verbatim.
+  if (pick.number !== null) {
+    key(session, [String(pick.number), "Enter"]);
+    return {
+      ok: true,
+      code: 0,
+      result,
+      payload: {
+        session,
+        intent,
+        prompt: result.prompt,
+        via: pick.via,
+        number: pick.number,
+        label: pick.label,
+      },
+    };
+  }
+
+  // Unnumbered cursor menu: must have exactly one selected option to navigate from.
+  if (pick.selectionState !== "single") {
+    return {
+      ok: false,
+      code: 3,
+      result,
+      payload: {
+        error:
+          pick.selectionState === "ambiguous"
+            ? "ambiguous selection"
+            : "no selection cursor",
+        session,
+        state: result.state,
+        intent,
+        options: result.options,
+        prompt: result.prompt,
+        hint: "Cannot navigate an unnumbered menu without a single visible cursor; use `ccb choose N` if positions are known",
+      },
+    };
+  }
+
+  const moves = [];
+  if (pick.moves.direction === "up") {
+    for (let i = 0; i < pick.moves.count; i++) moves.push("Up");
+  } else if (pick.moves.direction === "down") {
+    for (let i = 0; i < pick.moves.count; i++) moves.push("Down");
+  }
+  moves.push("Enter");
+  key(session, moves);
+
+  return {
+    ok: true,
+    code: 0,
+    result,
+    payload: {
+      session,
+      intent,
+      prompt: result.prompt,
+      via: pick.moves.count === 0 ? "cursor-confirm" : `cursor-${pick.moves.direction}`,
+      moves: pick.moves,
+      targetLabel: pick.label,
+      targetIndex: pick.targetIndex,
+      selectedIndex: pick.selectedIndex,
+    },
+  };
+}
+
+function sleepAsync(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Poll the pane and emit only state transitions. Exits 0 on done/crashed,
+// 5 on timeout, 4 on capture error. Ctrl+C exits 0 with a "stopped" event.
+async function watchSession(session, opts) {
+  const intervalMs = opts["interval-ms"];
+  const timeoutMs = opts["timeout-ms"];
+  const lines = opts.lines;
+  const json = Boolean(opts.json);
+  const start = Date.now();
+  let lastSig = "";
+  let lastState = "";
+  let stopped = false;
+
+  const finalize = (event) => {
+    if (json) {
+      process.stdout.write(
+        JSON.stringify({
+          event,
+          session,
+          watchedMs: Date.now() - start,
+        }) + "\n",
+      );
+    } else {
+      console.log(`\n[${event}]`);
+    }
+  };
+
+  const onSignal = () => {
+    if (stopped) return;
+    stopped = true;
+    finalize("stopped");
+    process.exit(0);
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+
+  while (!stopped) {
+    let raw;
+    try {
+      raw = captureSession(session, lines);
+    } catch (e) {
+      if (json) {
+        process.stdout.write(
+          JSON.stringify({
+            event: "error",
+            session,
+            error: e.message,
+          }) + "\n",
+        );
+      } else {
+        console.error(`capture error: ${e.message}`);
+      }
+      process.exit(4);
+    }
+    const result = classifyPane(raw, {
+      tailLines: Math.min(lines, 200),
+      excerptLines: 12,
+    });
+    const sig = [
+      result.state,
+      result.prompt || "",
+      (result.options || [])
+        .map((o) => `${o.number}:${o.label}:` + (o.selected ? "1" : "0"))
+        .join("|"),
+      result.doneMarker || "",
+    ].join("::");
+    if (sig !== lastSig) {
+      if (json) {
+        process.stdout.write(
+          JSON.stringify({
+            event: "transition",
+            session,
+            ts: new Date().toISOString(),
+            from: lastState,
+            to: result.state,
+            prompt: result.prompt,
+            options: result.options,
+            spinner: result.spinner,
+            doneMarker: result.doneMarker,
+            excerpt: result.excerpt,
+          }) + "\n",
+        );
+      } else {
+        const stamp = new Date().toISOString().split("T")[1].split(".")[0];
+        const meta = [
+          result.prompt ? `prompt=${result.prompt}` : "",
+          result.doneMarker ? result.doneMarker : "",
+          result.spinner ? `${result.spinner.label} (${result.spinner.detail})` : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
+        console.log(
+          `[${stamp}] ${lastState || "-"} -> ${result.state}${meta ? " | " + meta : ""}`,
+        );
+      }
+      lastSig = sig;
+      lastState = result.state;
+    }
+    if (result.state === "done" || result.state === "crashed") {
+      finalize(result.state);
+      return;
+    }
+    if (Date.now() - start >= timeoutMs) {
+      finalize("timeout");
+      process.exit(5);
+    }
+    await sleepAsync(intervalMs);
+  }
 }
 
 function tmux(args, options = {}) {
@@ -226,6 +553,42 @@ function enterText(session, text, enter = true) {
     }
   }
   return { session, tmuxSession: target, entered: enter, bytes: Buffer.byteLength(text) };
+}
+
+// Multiline-safe steer: load payload into a tmux buffer, paste with bracket
+// mode AND -r (no LF→CR conversion) so embedded newlines survive end-to-end.
+// Without -r tmux replaces each LF with CR, which a downstream input box may
+// interpret as separate Enter presses — truncating the paste to its first line.
+function steerMessage(session, message) {
+  const target = tmuxSessionName(session);
+  const tmpDir = path.join(os.tmpdir(), "codex-claude-bridge");
+  mkdirSync(tmpDir, { recursive: true });
+  const file = path.join(tmpDir, `${randomUUID()}.txt`);
+  const fullMessage = buildSteerPayload(message);
+  writeFileSync(file, fullMessage);
+  const buffer = `ccb-steer-${randomUUID()}`;
+  try {
+    tmux(["load-buffer", "-b", buffer, msysPathForShell(file)]);
+    tmux(["paste-buffer", "-dpr", "-b", buffer, "-t", target]);
+    tmux(["send-keys", "-t", target, "Enter"]);
+  } finally {
+    try {
+      unlinkSync(file);
+    } catch {
+      // Best effort cleanup.
+    }
+    try {
+      tmux(["delete-buffer", "-b", buffer]);
+    } catch {
+      // -d should already remove it; ignore if gone.
+    }
+  }
+  return {
+    session,
+    tmuxSession: target,
+    bytes: Buffer.byteLength(fullMessage),
+    lines: countLines(fullMessage),
+  };
 }
 
 function findGlobalCcmuxCore() {
@@ -275,6 +638,13 @@ export function msysPathForShell(value) {
   src = src.replace(
     /tmux\(\["load-buffer", "-b", bufferName, job\.promptPath\]\);/g,
     'tmux(["load-buffer", "-b", bufferName, msysPathForShell(job.promptPath)]);',
+  );
+
+  // steerSession uses load-buffer with its own promptPath; same Windows path bug.
+  // Leave an idempotent marker so re-running patchCcmuxWindows is a no-op.
+  src = src.replace(
+    /tmux\(\["load-buffer", "-b", id, promptPath\]\);/g,
+    'tmux(["load-buffer", "-b", id, msysPathForShell(promptPath)]); // ccb-patched',
   );
 
   if (!src.includes('if (process.platform === "win32") break;')) {
@@ -377,7 +747,7 @@ async function main() {
   if (command === "steer") {
     const message = opts._.join(" ").trim();
     if (!message) throw new Error("steer requires message");
-    process.stdout.write(must("ccmux", ["steer", "--session", session, message]));
+    console.log(JSON.stringify(steerMessage(session, message), null, 2));
     return;
   }
   if (command === "key") {
@@ -409,6 +779,48 @@ async function main() {
   }
   if (command === "wait-ready") {
     console.log(JSON.stringify(waitReady(session, Number(opts["timeout-ms"] || DEFAULT_READY_TIMEOUT_MS)), null, 2));
+    return;
+  }
+  if (command === "inspect") {
+    const lines = parsePositiveInt(opts.lines, DEFAULT_INSPECT_LINES, "lines");
+    inspectSession(session, lines, Boolean(opts.json));
+    return;
+  }
+  if (command === "approve" || command === "deny") {
+    const lines = parsePositiveInt(opts.lines, DEFAULT_INSPECT_LINES, "lines");
+    const outcome = resolvePromptAction(session, lines, command);
+    if (opts.json || !outcome.ok) {
+      process.stdout.write(JSON.stringify(outcome.payload, null, 2) + "\n");
+    } else {
+      const pick = outcome.payload;
+      const target =
+        pick.number !== undefined
+          ? `option ${pick.number} (${pick.label})`
+          : pick.targetLabel
+            ? `cursor -> ${pick.targetLabel}`
+            : pick.answer
+              ? pick.answer.toUpperCase()
+              : "?";
+      console.log(`${command}: ${pick.via} -> ${target}`);
+    }
+    process.exit(outcome.code);
+    return;
+  }
+  if (command === "watch") {
+    await watchSession(session, {
+      "interval-ms": parsePositiveInt(
+        opts["interval-ms"],
+        DEFAULT_WATCH_INTERVAL_MS,
+        "interval-ms",
+      ),
+      "timeout-ms": parsePositiveInt(
+        opts["timeout-ms"],
+        DEFAULT_WATCH_TIMEOUT_MS,
+        "timeout-ms",
+      ),
+      lines: parsePositiveInt(opts.lines, DEFAULT_INSPECT_LINES, "lines"),
+      json: Boolean(opts.json),
+    });
     return;
   }
   if (command === "attach") {

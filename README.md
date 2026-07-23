@@ -2,7 +2,7 @@
 
 Tiny CLI bridge for Codex to control persistent Claude Code sessions without using the Claude Agent SDK.
 
-It wraps [`claude-code-tmux`](https://www.npmjs.com/package/claude-code-tmux), which drives the real interactive `claude` CLI inside `tmux`. That means sessions persist, Codex can send follow-up prompts, and work can continue without losing Claude Code context.
+It wraps [`claude-code-tmux`](https://www.npmjs.com/package/claude-code-tmux), which drives the real interactive `claude` CLI inside `tmux`. Sessions persist, Codex can send follow-up prompts, and work can continue without losing Claude Code context.
 
 ## Install
 
@@ -34,27 +34,30 @@ ccb send --session auth-fix "Continue. Now run the focused tests."
 ccb capture --session auth-fix
 ```
 
-## Full Control
+## Inspecting and Acting on the Pane
 
-`send` is best when Codex wants a structured job result. It adds a completion protocol and waits:
-
-```bash
-ccb send --session auth-fix --cwd C:\repo\app --timeout-ms 180000 "Fix the failing auth test."
-```
-
-Use raw terminal controls when Codex needs to act like a human inside Claude Code:
+`ccb inspect` captures the pane, strips ANSI noise, and classifies Claude Code's current state. It only reads.
 
 ```bash
-ccb type --session auth-fix --enter "Continue, but do not edit files yet."
-ccb slash --session auth-fix "/cost"
-ccb choose --session auth-fix 1
-ccb key --session auth-fix Tab Enter
-ccb interrupt --session auth-fix
-ccb capture --session auth-fix --lines 160
-ccb wait-ready --session auth-fix
+ccb inspect --session auth-fix
+ccb inspect --session auth-fix --json
 ```
 
-The same `--session` always targets the same tmux-backed Claude Code process.
+States: `idle`, `thinking`, `needs_input`, `permission_prompt`, `done`, `crashed`, `unknown`.
+
+`ccb approve` and `ccb deny` inspect first, refuse with a nonzero exit when there is no prompt, and pick the semantically correct option by label. They never blindly assume positions. For unnumbered cursor menus they navigate with Up/Down from the current selection. When the cursor or target is ambiguous they refuse; fall back to `ccb choose N`.
+
+```bash
+ccb approve --session auth-fix
+ccb deny   --session auth-fix
+ccb choose --session auth-fix 2     # raw escape hatch
+```
+
+`ccb watch` polls the pane and emits only state transitions. With `--json` it emits JSON Lines.
+
+```bash
+ccb watch --session auth-fix --json --timeout-ms 600000
+```
 
 ## Commands
 
@@ -66,6 +69,10 @@ ccb send [--session NAME] [--cwd DIR] [--timeout-ms MS] [--startup-wait-ms MS] "
 ccb type [--session NAME] [--enter] "raw message"
 ccb slash [--session NAME] "command"
 ccb steer [--session NAME] "message"
+ccb inspect [--session NAME] [--lines N] [--json]
+ccb approve [--session NAME] [--lines N] [--json]
+ccb deny   [--session NAME] [--lines N] [--json]
+ccb watch [--session NAME] [--interval-ms MS] [--lines N] [--json] [--timeout-ms MS]
 ccb key [--session NAME] KEY [KEY...]
 ccb choose [--session NAME] NUMBER
 ccb enter [--session NAME]
@@ -82,16 +89,32 @@ ccb kill [--session NAME]
 
 ## Codex Usage
 
-From Codex, use:
-
 ```powershell
 ccb send --session repo-task --cwd C:\path\to\repo --timeout-ms 180000 "Do the task. When done, summarize files changed and tests run."
+ccb watch --session repo-task --json --timeout-ms 600000
 ```
 
 The same `--session` keeps talking to the same Claude Code tmux session.
 
+## Development
+
+```bash
+npm test         # parsing and classification tests
+npm run check    # tests + --help + doctor smoke
+```
+
+Pure parsing and classification logic lives in `lib/pane.mjs`. Multiline steer helpers live in `lib/steer.mjs`. Tests use canned pane fixtures in `test/`.
+
 ## Notes
 
-This is terminal automation, not an official Claude API. It is practical and durable, but depends on `ccmux`, `tmux`, and the interactive Claude Code CLI behavior.
+This is terminal automation, not an official Claude API. It depends on `ccmux`, `tmux`, and the interactive Claude Code CLI's behavior.
 
-On Windows, `patch-ccmux-windows` fixes current MSYS2/PowerShell path and quoting issues in `claude-code-tmux`.
+State classification favors explicit evidence and conservative `unknown` over risky false positives. Spinner detection is glyph-agnostic (CC rotates through `*`, `✻`, `✶`, `✢`, etc.). Hook errors in scrollback do not flip a healthy live UI to `crashed`. Permission classification keys off the question text; generic yes/no menus stay `needs_input`.
+
+On Windows, `patch-ccmux-windows` rewrites MSYS2/PowerShell path-quoting issues in `claude-code-tmux`:
+
+- `pipe-pane` log path quoting
+- `send-job` `load-buffer` path quoting
+- `steer` `load-buffer` path quoting (added 2026-07-23)
+
+`ccb steer` writes the message to a temp file, loads it into a tmux buffer, and pastes with `-dpr` (delete + bracket paste + preserve newlines) so multiline messages survive end-to-end.
