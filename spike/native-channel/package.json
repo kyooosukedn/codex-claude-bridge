@@ -1,0 +1,15 @@
+{
+  "name": "ccb-native-channel-spike",
+  "version": "0.0.1-spike",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/",
+    "channel-server": "node src/ccb-channel-server.mjs",
+    "probe-control": "node src/probe-control.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "zod": "4.4.3"
+  }
+}
