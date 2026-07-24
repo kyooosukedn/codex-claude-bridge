@@ -35,6 +35,22 @@ test("findAgentByName returns null when not found", () => {
   assert.equal(findAgentByName(agents, "nope"), null);
 });
 
+test("findAgentByName prefers newest active duplicate", () => {
+  const agents = [
+    { id: "old", name: "spike-1", state: "stopped", startedAt: 100 },
+    { id: "new", name: "spike-1", state: "blocked", startedAt: 200 },
+  ];
+  assert.equal(findAgentByName(agents, "spike-1")?.id, "new");
+});
+
+test("findAgentByName returns newest duplicate when all are stopped", () => {
+  const agents = [
+    { id: "old", name: "spike-1", state: "stopped", startedAt: 100 },
+    { id: "new", name: "spike-1", state: "stopped", startedAt: 200 },
+  ];
+  assert.equal(findAgentByName(agents, "spike-1")?.id, "new");
+});
+
 test("buildStartArgs constructs explicit development-channel launch", () => {
   const args = buildStartArgs({
     name: "spike-1",

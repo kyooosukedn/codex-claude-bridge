@@ -46,6 +46,21 @@ test("blocked + unknown waitingFor -> unknown", () => {
   assert.equal(mapNativeState({ status: "blocked", waitingFor: "something_new" }), "unknown");
 });
 
+test("lifecycle state takes precedence over secondary status", () => {
+  assert.equal(mapNativeState({ state: "blocked", status: "idle" }), "unknown");
+});
+
+test("lifecycle blocked plus waitingFor permission maps to permission_prompt", () => {
+  assert.equal(
+    mapNativeState({ state: "blocked", status: "idle", waitingFor: "permission" }),
+    "permission_prompt",
+  );
+});
+
+test("lifecycle stopped maps to stopped", () => {
+  assert.equal(mapNativeState({ state: "stopped" }), "stopped");
+});
+
 test("null agent -> unknown", () => {
   assert.equal(mapNativeState(null), "unknown");
 });
