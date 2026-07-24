@@ -1,10 +1,10 @@
 # R0/R1 Native Channel Spike — Implementation Plan
 
 **Spec:** [`docs/superpowers/specs/2026-07-23-native-control-plane-design.md`](../specs/2026-07-23-native-control-plane-design.md)
-**Status:** Approved execution plan, protocol-corrected after independent review. No implementation yet.
+**Status:** Executed 2026-07-24. R1 complete; R0 is NO-GO on current GLM/API-billing authentication; R2+ blocked pending eligible Anthropic-authenticated rerun.
 **Date:** 2026-07-24
 **Scope:** R0 (channel feasibility spike, go/no-go) and R1 (native adapter + version preflight) from the approved spec. Nothing beyond.
-**Current host:** Windows, Claude `2.1.150`, Node `22.12.0`.
+**Current host:** Windows, Claude `2.1.218`, portable Node `22.23.1`.
 **Target host:** latest stable Claude (`>= 2.1.212` for structured `waitingFor`), Node `>= 22.13` (for stable `node:sqlite` in later phases; R0/R1 itself only needs the system Node to run `node:test`).
 
 ## Scope
@@ -115,10 +115,12 @@ Goal: detect whether the host meets R0/R1 requirements, report the exact blocker
  * @typedef {Object} NativeAgent
  * @property {string} [id]
  * @property {string} [name]
+ * @property {string} [state]
  * @property {string} [status]
  * @property {string} [waitingFor]
  * @property {string} [cwd]
  * @property {string} [model]
+ * @property {number} [startedAt]
  */
 
 /**
@@ -507,6 +509,21 @@ test("blocked + unknown waitingFor -> unknown", () => {
   assert.equal(mapNativeState({ status: "blocked", waitingFor: "something_new" }), "unknown");
 });
 
+test("lifecycle state takes precedence over secondary status", () => {
+  assert.equal(mapNativeState({ state: "blocked", status: "idle" }), "unknown");
+});
+
+test("lifecycle blocked plus waitingFor permission maps to permission_prompt", () => {
+  assert.equal(
+    mapNativeState({ state: "blocked", status: "idle", waitingFor: "permission" }),
+    "permission_prompt",
+  );
+});
+
+test("lifecycle stopped maps to stopped", () => {
+  assert.equal(mapNativeState({ state: "stopped" }), "stopped");
+});
+
 test("null agent -> unknown", () => {
   assert.equal(mapNativeState(null), "unknown");
 });
@@ -534,14 +551,19 @@ Expected: `Error: Cannot find module` and 0 pass.
 // to a broker state string. See spec section "State machine and precedence".
 
 /**
- * @param {{ status?: string, waitingFor?: string } | null} agent
+ * @param {{ state?: string, status?: string, waitingFor?: string } | null} agent
  * @returns {"idle" | "thinking" | "needs_input" | "permission_prompt" | "done" | "crashed" | "stopped" | "unknown"}
  * Subset of BrokerState defined in types.mjs; excludes broker-only states
  * (starting, consent_pending, ready, waking, killed).
  */
 export function mapNativeState(agent) {
   if (!agent) return "unknown";
-  switch (agent.status) {
+  const lifecycleStates = new Set(["blocked", "stopped", "done", "failed"]);
+  const nativeState = lifecycleStates.has(agent.state)
+    ? agent.state
+    : agent.status ?? agent.state;
+
+  switch (nativeState) {
     case "idle":
       return "idle";
     case "working":
@@ -614,6 +636,22 @@ test("findAgentByName returns null when not found", () => {
   assert.equal(findAgentByName(agents, "nope"), null);
 });
 
+test("findAgentByName prefers newest active duplicate", () => {
+  const agents = [
+    { id: "old", name: "spike-1", state: "stopped", startedAt: 100 },
+    { id: "new", name: "spike-1", state: "blocked", startedAt: 200 },
+  ];
+  assert.equal(findAgentByName(agents, "spike-1")?.id, "new");
+});
+
+test("findAgentByName returns newest duplicate when all are stopped", () => {
+  const agents = [
+    { id: "old", name: "spike-1", state: "stopped", startedAt: 100 },
+    { id: "new", name: "spike-1", state: "stopped", startedAt: 200 },
+  ];
+  assert.equal(findAgentByName(agents, "spike-1")?.id, "new");
+});
+
 test("buildStartArgs constructs explicit development-channel launch", () => {
   const args = buildStartArgs({
     name: "spike-1",
@@ -678,7 +716,7 @@ const SHELL = process.platform === "win32";
 
 /**
  * @param {string} raw
- * @returns {Array<{ id?: string, name?: string, status?: string, waitingFor?: string, cwd?: string, model?: string }>}
+ * @returns {Array<{ id?: string, name?: string, state?: string, status?: string, waitingFor?: string, cwd?: string, model?: string, startedAt?: number }>}
  */
 export function parseAgentsJson(raw) {
   let parsed;
@@ -694,11 +732,23 @@ export function parseAgentsJson(raw) {
 }
 
 /**
- * @param {Array<{ name?: string }>} agents
+ * @param {Array<{ name?: string, state?: string, status?: string, startedAt?: number }>} agents
  * @param {string} name
  */
 export function findAgentByName(agents, name) {
-  return agents.find((a) => a.name === name) ?? null;
+  const matches = agents.filter((agent) => agent.name === name);
+  if (matches.length === 0) return null;
+
+  const terminalStates = new Set(["stopped", "done", "failed"]);
+  const active = matches.filter(
+    (agent) =>
+      !terminalStates.has(agent.state) &&
+      !terminalStates.has(agent.status),
+  );
+  const candidates = active.length > 0 ? active : matches;
+  return candidates.reduce((latest, candidate) =>
+    (candidate.startedAt ?? 0) > (latest.startedAt ?? 0) ? candidate : latest,
+  );
 }
 
 /**
@@ -744,7 +794,7 @@ function runClaude(args, opts = {}) {
 }
 
 /**
- * @returns {Array<{ id?: string, name?: string, status?: string, waitingFor?: string, cwd?: string, model?: string }>}
+ * @returns {Array<{ id?: string, name?: string, state?: string, status?: string, waitingFor?: string, cwd?: string, model?: string, startedAt?: number }>}
  */
 export function agentsJson() {
   return parseAgentsJson(runClaude(["agents", "--json", "--all"]));
@@ -1437,9 +1487,9 @@ function formatEvidence(obs) {
     ``,
     `## Conclusion`,
     ``,
-    `- **Channel connected in --bg mode:** \`connected: ${obs.connected}\` above.`,
-    `- **Consent required:** if \`connected\` is true, no interactive consent was needed for --bg. If false, check \`steps\` for consent-related output.`,
-    `- **Consent persisted:** re-run the experiment; if \`connected\` is consistently true without intervention, consent persisted.`,
+    `- **MCP process connected in --bg mode:** \`connected: ${obs.connected}\` above.`,
+    `- **Channel registration:** an MCP process connection does not prove Claude accepted the server as a channel. Require either a rendered channel notice or end-to-end injection/reply evidence.`,
+    `- **Consent/eligibility:** inspect an interactive launch when registration is not independently proven; Claude can load the MCP server while dropping channel notifications.`,
   ].join("\n");
 }
 
@@ -1474,7 +1524,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateTempConfig } from "../src/temp-config.mjs";
 import { makeProbeClient } from "../src/probe-client.mjs";
-import { startBackground, agentsJson, findAgentByName, stopAgent } from "../../../lib/native/adapter.mjs";
+import { startBackground, agentsJson, logs, stopAgent } from "../../../lib/native/adapter.mjs";
+import { stripAnsi } from "../../../lib/pane.mjs";
 
 const SPIKE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 mkdirSync(path.join(SPIKE_ROOT, "evidence"), { recursive: true });
@@ -1527,6 +1578,16 @@ async function main() {
       obs.reply_matches_expected = reply?.params?.text?.trim() === "SPIKE_INJECTION_OK";
     }
 
+    obs.probe_events = (await client.getEvents()).events || [];
+    const sessionAgent = agentsJson().find((agent) => agent.cwd === sessionCwd);
+    obs.agent_at_end = sessionAgent || null;
+    if (sessionAgent?.id) {
+      try {
+        obs.native_log_summary = summarizeNativeLogs(logs(sessionAgent.id));
+      } catch (error) {
+        obs.native_logs_error = error.message;
+      }
+    }
   } catch (error) {
     obs.error = error.message;
     process.exitCode = 1;
@@ -1537,7 +1598,7 @@ async function main() {
     );
     try {
       const agents = agentsJson();
-      const agent = findAgentByName(agents, SESSION_NAME);
+      const agent = agents.find((candidate) => candidate.cwd === sessionCwd);
       if (agent?.id) stopAgent(agent.id);
     } catch {}
     probeChild.kill("SIGTERM");
@@ -1563,6 +1624,20 @@ async function waitForReply(client, timeoutMs) {
     await new Promise((r) => setTimeout(r, 1000));
   }
   return null;
+}
+
+function summarizeNativeLogs(raw) {
+  const clean = stripAnsi(raw);
+  const relevantLines = clean
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /channel|SPIKE_INJECTION_OK|reply|permission/i.test(line))
+    .slice(-40);
+  return {
+    injected_marker_rendered: clean.includes("SPIKE_INJECTION_OK"),
+    channel_unavailable_rendered: /Channels are not currently available/i.test(clean),
+    relevant_lines: relevantLines,
+  };
 }
 
 function formatEvidence(obs) {
