@@ -1,12 +1,14 @@
 // test/native-preflight.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   parseClaudeVersion,
   compareVersions,
   nodeVersionTuple,
   evaluateVersions,
   formatBlockers,
+  preflight,
 } from "../lib/native/preflight.mjs";
 
 test("parseClaudeVersion extracts triple from '2.1.150 (Claude Code)'", () => {
@@ -67,4 +69,25 @@ test("formatBlockers: does not mention npm, apt, brew, or scoop", () => {
   const text = formatBlockers(result);
   assert.ok(!/npm install|apt install|brew install|scoop install/i.test(text),
     `blocker text must not assume a package manager; got: ${text}`);
+});
+
+test("module can be imported when process.argv[1] is absent", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--input-type=module", "-e", "await import('./lib/native/preflight.mjs')"],
+    { cwd: process.cwd(), encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test("preflight returns its verdict when recording fails", () => {
+  const result = preflight({
+    claudeRaw: "2.1.218 (Claude Code)",
+    nodeRaw: "22.23.1",
+    record: () => {
+      throw new Error("read-only preflight directory");
+    },
+  });
+  assert.equal(result.allOk, true);
+  assert.equal(result.recordError, "read-only preflight directory");
 });

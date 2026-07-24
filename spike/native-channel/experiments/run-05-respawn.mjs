@@ -90,6 +90,7 @@ async function main() {
       reply: recalledText,
       marker_recalled_exactly: recalledText === MARKER,
     });
+    if (recalledText !== MARKER) process.exitCode = 1;
 
     // 5. Keep native logs as diagnostics, not as proof: the original prompt
     // itself contains the marker and would otherwise create a false positive.

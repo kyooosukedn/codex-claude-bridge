@@ -61,6 +61,7 @@ async function main() {
       obs.reply_received_at = reply?.received_at || null;
       obs.reply_matches_expected = reply?.params?.text?.trim() === "SPIKE_INJECTION_OK";
     }
+    if (!obs.reply_matches_expected) process.exitCode = 1;
 
     obs.probe_events = (await client.getEvents()).events || [];
     const sessionAgent = agentsJson().find((agent) => agent.cwd === sessionCwd);

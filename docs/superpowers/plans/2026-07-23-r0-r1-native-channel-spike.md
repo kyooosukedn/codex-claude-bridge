@@ -143,12 +143,14 @@ Goal: detect whether the host meets R0/R1 requirements, report the exact blocker
 // test/native-preflight.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   parseClaudeVersion,
   compareVersions,
   nodeVersionTuple,
   evaluateVersions,
   formatBlockers,
+  preflight,
 } from "../lib/native/preflight.mjs";
 
 test("parseClaudeVersion extracts triple from '2.1.150 (Claude Code)'", () => {
@@ -209,6 +211,27 @@ test("formatBlockers: does not mention npm, apt, brew, or scoop", () => {
   const text = formatBlockers(result);
   assert.ok(!/npm install|apt install|brew install|scoop install/i.test(text),
     `blocker text must not assume a package manager; got: ${text}`);
+});
+
+test("module can be imported when process.argv[1] is absent", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--input-type=module", "-e", "await import('./lib/native/preflight.mjs')"],
+    { cwd: process.cwd(), encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test("preflight returns its verdict when recording fails", () => {
+  const result = preflight({
+    claudeRaw: "2.1.218 (Claude Code)",
+    nodeRaw: "22.23.1",
+    record: () => {
+      throw new Error("read-only preflight directory");
+    },
+  });
+  assert.equal(result.allOk, true);
+  assert.equal(result.recordError, "read-only preflight directory");
 });
 ```
 
@@ -380,21 +403,33 @@ export function readLastPreflight() {
 
 /**
  * Run the full preflight: probe versions, evaluate, record, return.
- * @returns {ReturnType<typeof evaluateVersions>}
+ * Recording is best-effort so a filesystem problem cannot hide the verdict.
+ * @param {{ claudeRaw?: string | null, nodeRaw?: string, record?: typeof recordPreflight }} [opts]
+ * @returns {ReturnType<typeof evaluateVersions> & { recordError: string | null }}
  */
-export function preflight() {
+export function preflight(opts = {}) {
   const evaluated = evaluateVersions({
-    claudeRaw: claudeVersionRaw(),
-    nodeRaw: process.versions.node,
+    claudeRaw: opts.claudeRaw === undefined ? claudeVersionRaw() : opts.claudeRaw,
+    nodeRaw: opts.nodeRaw ?? process.versions.node,
   });
-  recordPreflight(evaluated);
-  return evaluated;
+  try {
+    (opts.record ?? recordPreflight)(evaluated);
+    return { ...evaluated, recordError: null };
+  } catch (error) {
+    return {
+      ...evaluated,
+      recordError: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 // CLI entry point: `node lib/native/preflight.mjs [--json]`
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const json = process.argv.includes("--json");
   const result = preflight();
+  if (result.recordError) {
+    console.error(`warning: could not record preflight result: ${result.recordError}`);
+  }
   if (json) {
     process.stdout.write(JSON.stringify(result, null, 2) + "\n");
   } else {
@@ -602,7 +637,12 @@ Expected: `# pass 12`, `# fail 0`. The twelve tests cover `idle`, `working`, `do
 // test/native-adapter.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseAgentsJson, findAgentByName, buildStartArgs } from "../lib/native/adapter.mjs";
+import {
+  parseAgentsJson,
+  findAgentByName,
+  buildStartArgs,
+  resolveClaudeExecutable,
+} from "../lib/native/adapter.mjs";
 
 test("parseAgentsJson parses a working agent", () => {
   const raw = JSON.stringify([
@@ -691,6 +731,36 @@ test("buildStartArgs can start a native session without a channel", () => {
     "state-only",
   ]);
 });
+
+test("resolveClaudeExecutable honors explicit override", () => {
+  assert.equal(
+    resolveClaudeExecutable({
+      platform: "win32",
+      env: { CCB_CLAUDE_PATH: "D:\\tools\\claude.exe" },
+      exists: () => false,
+    }),
+    "D:\\tools\\claude.exe",
+  );
+});
+
+test("resolveClaudeExecutable finds npm-installed native Windows binary", () => {
+  const expected = "C:\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe";
+  assert.equal(
+    resolveClaudeExecutable({
+      platform: "win32",
+      env: { PATH: "C:\\npm;D:\\bin" },
+      exists: (candidate) => candidate === expected,
+    }),
+    expected,
+  );
+});
+
+test("resolveClaudeExecutable uses PATH lookup on non-Windows platforms", () => {
+  assert.equal(
+    resolveClaudeExecutable({ platform: "linux", env: {}, exists: () => false }),
+    "claude",
+  );
+});
 ```
 
 - [ ] Run and observe failure.
@@ -711,8 +781,43 @@ Expected: `Cannot find module` and 0 pass.
 // are unit-tested; spawn wrappers are exercised by live smoke in Phase 3.
 
 import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import path from "node:path";
 
-const SHELL = process.platform === "win32";
+/**
+ * Resolve a directly executable Claude binary so user-influenced CLI arguments
+ * never pass through a command shell.
+ * @param {{ platform?: string, env?: NodeJS.ProcessEnv, exists?: (candidate: string) => boolean }} [opts]
+ * @returns {string}
+ */
+export function resolveClaudeExecutable(opts = {}) {
+  const platform = opts.platform ?? process.platform;
+  const env = opts.env ?? process.env;
+  const exists = opts.exists ?? existsSync;
+  if (env.CCB_CLAUDE_PATH) return env.CCB_CLAUDE_PATH;
+  if (platform !== "win32") return "claude";
+
+  const pathValue = env.Path ?? env.PATH ?? "";
+  for (const directory of pathValue.split(path.win32.delimiter).filter(Boolean)) {
+    const candidates = [
+      path.win32.join(directory, "claude.exe"),
+      path.win32.join(
+        directory,
+        "node_modules",
+        "@anthropic-ai",
+        "claude-code",
+        "bin",
+        "claude.exe",
+      ),
+    ];
+    for (const candidate of candidates) {
+      if (exists(candidate)) return candidate;
+    }
+  }
+  throw new Error(
+    "Could not resolve a shell-free Claude executable. Set CCB_CLAUDE_PATH to claude.exe.",
+  );
+}
 
 /**
  * @param {string} raw
@@ -777,12 +882,12 @@ export function buildStartArgs({ name, configPath, model, effort }) {
  * @returns {string}
  */
 function runClaude(args, opts = {}) {
-  const r = spawnSync("claude", args, {
+  const r = spawnSync(resolveClaudeExecutable({ env: opts.env ?? process.env }), args, {
     encoding: "utf8",
     cwd: opts.cwd,
     env: opts.env,
     timeout: opts.timeoutMs ?? 30000,
-    shell: SHELL,
+    shell: false,
   });
   if (r.error) throw r.error;
   if (r.status !== 0) {
@@ -847,12 +952,17 @@ export function logs(id) {
  * @param {{ cwd?: string, env?: Object }} [opts]
  */
 export function attachInteractive(id, opts = {}) {
-  const r = spawnSync("claude", ["attach", id], {
-    cwd: opts.cwd,
-    env: opts.env,
-    stdio: "inherit",
-    shell: SHELL,
-  });
+  const r = spawnSync(
+    resolveClaudeExecutable({ env: opts.env ?? process.env }),
+    ["attach", id],
+    {
+      cwd: opts.cwd,
+      env: opts.env,
+      stdio: "inherit",
+      shell: false,
+    },
+  );
+  if (r.error) throw r.error;
   if (r.status !== 0) {
     throw new Error(`claude attach ${id} exited ${r.status}`);
   }
@@ -1272,7 +1382,7 @@ export function generateTempConfig({ probeUrl, probeToken }) {
 }
 
 // CLI entry: `node src/temp-config.mjs <probeUrl> <probeToken>`
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const [probeUrl, probeToken] = process.argv.slice(2);
   if (!probeUrl || !probeToken) {
     console.error("Usage: temp-config.mjs <probeUrl> <probeToken>");
@@ -1437,6 +1547,7 @@ async function main() {
       agent_state_at_check: agentState,
     });
     observations.connected = connected;
+    if (!connected) process.exitCode = 1;
 
     // 5. If not connected, the implementer must `claude attach <id>` and
     //    observe whether a consent prompt appears. Record that as a manual step.
@@ -1577,6 +1688,7 @@ async function main() {
       obs.reply_received_at = reply?.received_at || null;
       obs.reply_matches_expected = reply?.params?.text?.trim() === "SPIKE_INJECTION_OK";
     }
+    if (!obs.reply_matches_expected) process.exitCode = 1;
 
     obs.probe_events = (await client.getEvents()).events || [];
     const sessionAgent = agentsJson().find((agent) => agent.cwd === sessionCwd);
@@ -1744,6 +1856,9 @@ async function main() {
         seenRequestIds,
       }),
     );
+    if (obs.trials.length !== 2 || obs.trials.some((trial) => !trial.verdict_honored)) {
+      process.exitCode = 1;
+    }
 
   } catch (error) {
     obs.error = error.message;
@@ -2100,6 +2215,7 @@ async function main() {
       reply: recalledText,
       marker_recalled_exactly: recalledText === MARKER,
     });
+    if (recalledText !== MARKER) process.exitCode = 1;
 
     // 5. Keep native logs as diagnostics, not as proof: the original prompt
     // itself contains the marker and would otherwise create a false positive.

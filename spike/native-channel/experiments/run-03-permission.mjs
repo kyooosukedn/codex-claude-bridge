@@ -65,6 +65,9 @@ async function main() {
         seenRequestIds,
       }),
     );
+    if (obs.trials.length !== 2 || obs.trials.some((trial) => !trial.verdict_honored)) {
+      process.exitCode = 1;
+    }
 
   } catch (error) {
     obs.error = error.message;

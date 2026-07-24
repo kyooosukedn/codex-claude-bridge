@@ -41,7 +41,7 @@ export function generateTempConfig({ probeUrl, probeToken }) {
 }
 
 // CLI entry: `node src/temp-config.mjs <probeUrl> <probeToken>`
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const [probeUrl, probeToken] = process.argv.slice(2);
   if (!probeUrl || !probeToken) {
     console.error("Usage: temp-config.mjs <probeUrl> <probeToken>");

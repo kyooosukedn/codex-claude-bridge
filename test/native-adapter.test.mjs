@@ -1,7 +1,12 @@
 // test/native-adapter.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseAgentsJson, findAgentByName, buildStartArgs } from "../lib/native/adapter.mjs";
+import {
+  parseAgentsJson,
+  findAgentByName,
+  buildStartArgs,
+  resolveClaudeExecutable,
+} from "../lib/native/adapter.mjs";
 
 test("parseAgentsJson parses a working agent", () => {
   const raw = JSON.stringify([
@@ -89,4 +94,34 @@ test("buildStartArgs can start a native session without a channel", () => {
     "--name",
     "state-only",
   ]);
+});
+
+test("resolveClaudeExecutable honors explicit override", () => {
+  assert.equal(
+    resolveClaudeExecutable({
+      platform: "win32",
+      env: { CCB_CLAUDE_PATH: "D:\\tools\\claude.exe" },
+      exists: () => false,
+    }),
+    "D:\\tools\\claude.exe",
+  );
+});
+
+test("resolveClaudeExecutable finds npm-installed native Windows binary", () => {
+  const expected = "C:\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe";
+  assert.equal(
+    resolveClaudeExecutable({
+      platform: "win32",
+      env: { PATH: "C:\\npm;D:\\bin" },
+      exists: (candidate) => candidate === expected,
+    }),
+    expected,
+  );
+});
+
+test("resolveClaudeExecutable uses PATH lookup on non-Windows platforms", () => {
+  assert.equal(
+    resolveClaudeExecutable({ platform: "linux", env: {}, exists: () => false }),
+    "claude",
+  );
 });

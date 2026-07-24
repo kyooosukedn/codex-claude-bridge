@@ -81,6 +81,7 @@ async function main() {
       agent_state_at_check: agentState,
     });
     observations.connected = connected;
+    if (!connected) process.exitCode = 1;
 
     // 5. If not connected, the implementer must `claude attach <id>` and
     //    observe whether a consent prompt appears. Record that as a manual step.
