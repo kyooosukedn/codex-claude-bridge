@@ -99,16 +99,18 @@ The bridge prefers to refuse over guessing. Concrete failure modes:
 
 A slash command is a mode-changing input. Historically `ccb slash` returned as soon as the text was pasted, so a `ccb send` issued immediately afterward could be lost while the pane was still mid-transition — and the idle `>` marker lingers in scrollback, so even a readiness check could be fooled by stale output. `ccb slash` now applies a readiness barrier:
 
-- Before delivery it captures a baseline fingerprint of the pane tail.
+- In waited mode it captures a **baseline** fingerprint of the pane tail **before** delivery, and that capture is **fail-closed**: if `ccmux capture` fails, the command aborts with exit code 7 and **does not deliver** (no `injectedAt`), rather than inject into a pane it cannot reason about.
 - After delivery it polls the pane (via `ccmux capture`) until the tail **changes** from the baseline **and** classifies as `idle`, then returns. Requiring a change is what defeats the stale-`>` false-positive.
 - The observed state is reported honestly in the JSON output (`readiness.state`, `readiness.reason`), never inferred as success. A slash that opens a menu surfaces `state: "needs_input"` with `reason: "timeout-not-ready"` rather than claiming ready.
+- `injectedAt` is recorded **only after** the paste succeeds, so the timestamp means "injection completed", not "we started". It is absent when nothing was injected (baseline failure).
 
 Guarantees and controls:
 
-- **Default timeout:** 30000 ms (`DEFAULT_MODE_READY_TIMEOUT_MS`), polled every 1000 ms. Override with `--ready-timeout-ms <ms>` (positive integer; misuse exits 2).
-- **Escape hatch:** `--no-wait` restores fire-and-forget; the output then carries `readiness: { waited: false, ready: null, reason: "skipped" }`.
-- **Timeout outcomes:** `reason: "timeout-stale"` means the tail never changed (stale output or a frozen pane); `reason: "timeout-not-ready"` means it changed but never settled to idle (e.g. a slash-opened menu); `reason: "capture-error"` means `ccmux capture` failed mid-poll. In every non-ready case delivery still occurred (exit 0) — callers should branch on `readiness.ready`, not on the exit code.
-- **Telemetry:** every `ccb slash` result carries `commandId`, `injectedAt`, and (when waited) `readiness.readyAt`, `waitedMs`, `attempts`, `reason`, and `evidence` for audit.
+- **Default timeout:** 30000 ms (`DEFAULT_MODE_READY_TIMEOUT_MS`), polled every 1000 ms. Override with `--ready-timeout-ms <ms>` (positive integer; validated **before** any side effect, so misuse exits 2 without delivering).
+- **Exit codes:** only a confirmed-ready result or `--no-wait` exits 0. A waited barrier that does **not** confirm ready exits 6 (delivery happened; telemetry is still emitted). A baseline-capture failure exits 7 (no delivery). This stops a sequential caller from proceeding into a known non-ready pane and recreating the lost-delivery failure mode.
+- **Escape hatch:** `--no-wait` restores fire-and-forget — it skips baseline capture and the barrier entirely and exits 0; the output carries `readiness: { waited: false, ready: null, reason: "skipped" }`.
+- **Outcomes:** `reason: "timeout-stale"` means the tail never changed (stale output or a frozen pane); `reason: "timeout-not-ready"` means it changed but never settled to idle (e.g. a slash-opened menu); `reason: "capture-error"` means `ccmux capture` failed mid-poll; `reason: "baseline-capture-failed"` means the pre-delivery baseline could not be acquired.
+- **Telemetry:** every `ccb slash` result carries `commandId`, `injectedAt` (on successful delivery), and (when waited) `readiness.readyAt`, `waitedMs`, `attempts`, `reason`, and `evidence` for audit.
 
 Scope: `send` and `steer` are unchanged in this slice; the barrier lives on `slash` because that is where the mode-changing gap was reproduced.
 
@@ -122,6 +124,8 @@ Scope: `send` and `steer` are unchanged in this slice; the barrier lives on `sla
 | 3    | `approve`/`deny` saw a prompt but could not safely pick an option.                              |
 | 4    | `watch` capture threw an error.                                                                 |
 | 5    | `watch` reached `--timeout-ms`.                                                                 |
+| 6    | `slash` (waited): delivered, but the readiness barrier did not confirm a ready pane.             |
+| 7    | `slash` (waited): baseline capture failed; nothing was delivered.                               |
 
 ### What Codex should do on `unknown` or refusal
 
@@ -130,6 +134,8 @@ Scope: `send` and `steer` are unchanged in this slice; the barrier lives on `sla
 - **On exit code 3 from `approve`/`deny`**: a prompt is visible but the bridge could not match an option label. Either inspect the option list and call `ccb choose N` with the known number, or fall back to `ccb type` / `ccb key` with raw keystrokes.
 - **On `watch` exit code 4**: the session or `ccmux` is unhealthy. Run `ccb doctor`, then `ccb status`.
 - **On `watch` exit code 5**: the session did not reach `done`/`crashed` within `--timeout-ms`. Decide whether to extend the timeout, intervene manually, or give up.
+- **On `ccb slash` exit code 6** (waited, delivered but not ready): do not immediately `send` — the pane did not settle to a ready state. Read `readiness.state`/`readiness.reason` from the slash output and `ccb inspect` to see why (e.g. the slash opened a menu), resolve it, then retry.
+- **On `ccb slash` exit code 7** (waited, baseline capture failed): nothing was delivered. The session or `ccmux` is unhealthy — run `ccb doctor`, then `ccb status`, and re-establish the session before retrying.
 
 ## Confidence labels
 

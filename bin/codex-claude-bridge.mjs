@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   classifyPane,
   selectOption,
@@ -31,6 +31,13 @@ const DEFAULT_WATCH_TIMEOUT_MS = 600000;
 // returning. See lib/readiness.mjs and docs/RELIABILITY.md.
 const DEFAULT_MODE_READY_TIMEOUT_MS = 30000;
 const DEFAULT_MODE_READY_INTERVAL_MS = 1000;
+// `ccb slash` exit codes (readiness outcomes). Kept distinct from generic 1
+// (uncaught error) and 2 (usage) so callers and CI can branch on delivery
+// semantics. See docs/RELIABILITY.md "Readiness barrier after slash commands".
+//   6 = delivered, but the barrier did NOT confirm a ready pane.
+//   7 = waited mode: baseline capture failed, so NOTHING was delivered.
+const SLASH_NOT_READY_EXIT = 6;
+const SLASH_BASELINE_FAILED_EXIT = 7;
 const MSYS_BIN = "C:\\msys64\\usr\\bin";
 const BOOLEAN_FLAGS = new Set([
   "enter",
@@ -252,17 +259,6 @@ function waitReady(session, timeoutMs = DEFAULT_READY_TIMEOUT_MS) {
   return { ready: false, session, waitedMs: Date.now() - start, tail: last };
 }
 
-// Best-effort pane capture for the readiness baseline. Returns "" on failure so
-// a flaky capture degrades gracefully (the barrier still runs, just without
-// stale-protection for the very first poll) instead of aborting the slash.
-function captureBaseline(session) {
-  try {
-    return captureSession(session, 80);
-  } catch {
-    return "";
-  }
-}
-
 // Drives the pure awaitReadyState barrier against a live session. Used by
 // `ccb slash` to confirm the pane has re-rendered into a fresh idle state after
 // a mode-changing input, defeating the stale `>` false-positive. A capture that
@@ -275,6 +271,102 @@ async function modeReadyBarrier(session, baseline, timeoutMs, intervalMs) {
     timeoutMs,
     intervalMs,
   });
+}
+
+// Real subprocess deps for executeSlash. `captureBaseline` is intentionally the
+// THROWING captureSession (not a swallowing wrapper): in waited mode a failed
+// baseline must fail closed BEFORE delivery, so the caller never injects into a
+// pane it cannot reason about. Tests inject fakes (see test/slash-handler.test.mjs).
+function defaultSlashDeps() {
+  return {
+    captureBaseline: (session) => captureSession(session, 80),
+    enterText,
+    modeReadyBarrier,
+    now: () => Date.now(),
+  };
+}
+
+// Orchestration for `ccb slash`. Pure with respect to the injected deps; returns
+// { body, exitCode } so main() can always print telemetry and then branch on the
+// exit code. Behaviors (see docs/RELIABILITY.md):
+//   - injectedAt is set ONLY after enterText succeeds (truthful telemetry).
+//   - Waited mode acquires the baseline FAIL-CLOSED: a capture failure aborts
+//     before delivery (no enterText) -> exit SLASH_BASELINE_FAILED_EXIT (7).
+//   - A waited barrier that does not confirm ready -> exit SLASH_NOT_READY_EXIT
+//     (6); telemetry is still emitted. Only ready:true or --no-wait may exit 0.
+//   - --no-wait skips baseline and barrier entirely (no capture before delivery).
+export async function executeSlash({ session, text, opts, deps = defaultSlashDeps() }) {
+  const now = deps.now || (() => Date.now());
+  const commandId = randomUUID();
+  const noWait = opts["no-wait"] === true;
+
+  if (noWait) {
+    const delivered = deps.enterText(session, text, true);
+    return {
+      body: {
+        ...delivered,
+        command: text,
+        commandId,
+        injectedAt: new Date(now()).toISOString(),
+        readiness: { waited: false, ready: null, reason: "skipped" },
+      },
+      exitCode: 0,
+    };
+  }
+
+  // Validate BEFORE any side effect so a bad --ready-timeout-ms does not deliver.
+  const readyTimeoutMs = parsePositiveInt(
+    opts["ready-timeout-ms"],
+    DEFAULT_MODE_READY_TIMEOUT_MS,
+    "ready-timeout-ms",
+  );
+
+  // Fail-closed baseline: capture must succeed before we inject anything,
+  // otherwise the barrier would run without stale-protection on the first poll.
+  let baseline;
+  try {
+    baseline = await deps.captureBaseline(session);
+  } catch (e) {
+    return {
+      body: {
+        session,
+        command: text,
+        commandId,
+        readiness: {
+          waited: true,
+          ready: false,
+          state: "unknown",
+          reason: "baseline-capture-failed",
+          evidence: { captureError: e?.message ?? String(e) },
+        },
+      },
+      exitCode: SLASH_BASELINE_FAILED_EXIT,
+    };
+  }
+
+  const delivered = deps.enterText(session, text, true);
+  const injectedAt = new Date(now()).toISOString();
+
+  const barrier = await deps.modeReadyBarrier(
+    session,
+    baseline,
+    readyTimeoutMs,
+    DEFAULT_MODE_READY_INTERVAL_MS,
+  );
+  const readiness = {
+    waited: true,
+    ready: barrier.ready,
+    state: barrier.state,
+    readyAt: barrier.ready ? new Date(now()).toISOString() : null,
+    waitedMs: barrier.waitedMs,
+    attempts: barrier.attempts,
+    reason: barrier.reason,
+    evidence: barrier.evidence,
+  };
+  return {
+    body: { ...delivered, command: text, commandId, injectedAt, readiness },
+    exitCode: barrier.ready ? 0 : SLASH_NOT_READY_EXIT,
+  };
 }
 
 function inspectSession(session, lines, json) {
@@ -773,60 +865,13 @@ async function main() {
     const slash = opts._.join(" ").trim();
     if (!slash) throw new Error("slash requires command");
     const text = slash.startsWith("/") ? slash : `/${slash}`;
-    // Readiness barrier after a mode-changing input. Capture the pane tail
-    // before delivery, deliver, then wait for the tail to CHANGE and settle
-    // into a fresh idle state. This closes the deterministic
-    // lost-prompt-after-slash gap (the next `ccb send` sees a ready pane) and
-    // defeats the stale `>` false-positive that fooled the old heuristic.
-    // `--no-wait` restores fire-and-forget; output fields are additive only.
-    // Validate flags BEFORE any side effect so a bad --ready-timeout-ms exits
-    // without delivering to the session.
-    const noWait = opts["no-wait"] === true;
-    const readyTimeoutMs = noWait
-      ? DEFAULT_MODE_READY_TIMEOUT_MS
-      : parsePositiveInt(
-          opts["ready-timeout-ms"],
-          DEFAULT_MODE_READY_TIMEOUT_MS,
-          "ready-timeout-ms",
-        );
-    const baseline = captureBaseline(session);
-    const commandId = randomUUID();
-    const injectedAt = new Date().toISOString();
-    const delivered = enterText(session, text, true);
-    let readiness;
-    if (noWait) {
-      readiness = { waited: false, ready: null, reason: "skipped" };
-    } else {
-      const barrier = await modeReadyBarrier(
-        session,
-        baseline,
-        readyTimeoutMs,
-        DEFAULT_MODE_READY_INTERVAL_MS,
-      );
-      readiness = {
-        waited: true,
-        ready: barrier.ready,
-        state: barrier.state,
-        readyAt: barrier.ready ? new Date().toISOString() : null,
-        waitedMs: barrier.waitedMs,
-        attempts: barrier.attempts,
-        reason: barrier.reason,
-        evidence: barrier.evidence,
-      };
-    }
-    console.log(
-      JSON.stringify(
-        {
-          ...delivered,
-          command: text,
-          commandId,
-          injectedAt,
-          readiness,
-        },
-        null,
-        2,
-      ),
-    );
+    // Orchestration (fail-closed baseline, delivery, readiness barrier, truthful
+    // injectedAt, and exit codes) lives in executeSlash so it is unit-testable.
+    // main() always prints the telemetry body, then propagates a nonzero exit
+    // code so a sequential caller cannot proceed into a known non-ready pane.
+    const { body, exitCode } = await executeSlash({ session, text, opts });
+    console.log(JSON.stringify(body, null, 2));
+    if (exitCode !== 0) process.exit(exitCode);
     return;
   }
   if (command === "steer") {
@@ -920,7 +965,12 @@ async function main() {
   throw new Error(`Unknown command: ${command}`);
 }
 
-main().catch((error) => {
-  console.error(error.message || String(error));
-  process.exit(1);
-});
+// Run main() only when executed directly, not when imported (e.g. by tests).
+const isMainModule =
+  import.meta.url === pathToFileURL(process.argv[1] || "").href;
+if (isMainModule) {
+  main().catch((error) => {
+    console.error(error.message || String(error));
+    process.exit(1);
+  });
+}
