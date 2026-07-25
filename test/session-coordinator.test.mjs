@@ -29,14 +29,13 @@ class FakeStore {
     return record ? structuredClone(record) : null;
   }
 
-  async rename(filePath, quarantinePath) {
+  async claimDeadGeneration(filePath, quarantinePath) {
     if (!this.files.has(filePath) || this.files.has(quarantinePath)) {
-      return { renamed: false };
+      return { claimed: false };
     }
     const record = this.files.get(filePath);
-    this.files.delete(filePath);
-    this.files.set(quarantinePath, record);
-    return { renamed: true };
+    this.files.set(quarantinePath, structuredClone(record));
+    return { claimed: true };
   }
 
   async updateIfOwner(filePath, ownerToken, commandId, patch) {

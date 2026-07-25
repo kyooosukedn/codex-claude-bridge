@@ -8,8 +8,8 @@ interleaving within one Claude session while preserving cross-session concurrenc
 and same-session steering during a long Claude task.
 
 **Architecture:** Add a daemon-free local coordinator backed by an `O_EXCL`
-lockfile. Reclaim only a definitely dead PID through atomic quarantine rename plus
-fresh `O_EXCL`. Split public ccmux `send` and `wait`; hold the lock through
+lockfile. Reclaim only a definitely dead PID through an atomic hard-link
+generation claim plus fresh `O_EXCL`. Split public ccmux `send` and `wait`; hold the lock through
 observed injection acknowledgment, then wait outside it.
 
 **ADR:** `docs/adr/0001-per-session-command-serialization.md`
@@ -95,7 +95,7 @@ The injected store contract is:
 {
   createExclusive(filePath, record),
   read(filePath),
-  rename(filePath, quarantinePath),
+  claimDeadGeneration(filePath, quarantinePath),
   updateIfOwner(filePath, ownerToken, commandId, patch),
   unlinkIfOwner(filePath, ownerToken, commandId),
 }
@@ -200,8 +200,8 @@ Implement:
 3. Create directories as user-only where the platform supports modes.
 4. `createExclusive` uses `fs.promises.open(path, "wx", 0o600)`, writes the full
    serialized record through that handle, calls `handle.sync()`, then closes.
-5. `rename` moves canonical lock to a UUID quarantine sibling. Never overwrite a
-   quarantine target.
+5. `claimDeadGeneration` uses `fs.link` to create a deterministic quarantine
+   tombstone without overwriting an existing generation claim.
 6. `updateIfOwner` verifies token and command id, writes a temp sibling, syncs,
    then atomically renames over the canonical file. Only the current live owner
    calls this operation.
@@ -210,7 +210,7 @@ Implement:
 Filesystem tests:
 
 - real `O_EXCL` permits one winner across child processes
-- real rename removes one dead generation
+- real hard-link claim permits one contender for a dead generation
 - quarantine names cannot escape the lock directory
 - malformed canonical lock fails closed
 - mode is `0600` on POSIX
@@ -243,8 +243,9 @@ Algorithm:
 4. Call injected `isProcessAlive(pid)`.
 5. Treat `true` and `unknown` as non-reclaimable.
 6. Only `false`, backed by `ESRCH` in production, enters recovery.
-7. Rename canonical to unique quarantine.
-8. Whether rename wins or loses, restart normal acquisition.
+7. Hard-link canonical to a deterministic quarantine path derived from the dead
+   owner token.
+8. Only the link winner verifies the tombstone and unlinks canonical.
 9. Return ownership only after a new `createExclusive` succeeds.
 
 Production liveness:
@@ -266,7 +267,7 @@ Required race test:
 - release all contenders with one synchronization barrier
 - assert exactly one returns `acquired: true`
 - assert canonical metadata equals that winner
-- assert no contender reports ownership merely because it won rename
+- assert no contender reports ownership merely because it won the hard-link claim
 
 Do not use timestamps as a reclaim predicate.
 
