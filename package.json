@@ -8,9 +8,9 @@
     "ccb": "./bin/codex-claude-bridge.mjs"
   },
   "scripts": {
-    "test": "node --test test/pane.test.mjs test/readiness.test.mjs test/slash-handler.test.mjs test/slash-cli.test.mjs",
+    "test": "node --test test/pane.test.mjs test/readiness.test.mjs test/slash-handler.test.mjs test/slash-cli.test.mjs test/installed-bin.test.mjs",
     "test:native": "node --test test/native-preflight.test.mjs test/native-adapter.test.mjs test/native-state-map.test.mjs",
-    "check": "node --test test/pane.test.mjs test/readiness.test.mjs test/slash-handler.test.mjs test/slash-cli.test.mjs && node ./bin/codex-claude-bridge.mjs --help && node ./bin/codex-claude-bridge.mjs doctor --json"
+    "check": "node --test test/pane.test.mjs test/readiness.test.mjs test/slash-handler.test.mjs test/slash-cli.test.mjs test/installed-bin.test.mjs && node ./bin/codex-claude-bridge.mjs --help && node ./bin/codex-claude-bridge.mjs doctor --json"
   },
   "keywords": [
     "codex",
