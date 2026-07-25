@@ -77,7 +77,7 @@ Usage:
   ccb start [--session NAME] [--cwd DIR] [--model MODEL] [--effort LEVEL] [--safe-permissions]
   ccb send [--session NAME] [--cwd DIR] [--timeout-ms MS] [--startup-wait-ms MS] "prompt"
   ccb type [--session NAME] [--enter] "raw message"
-  ccb slash [--session NAME] "command"
+  ccb slash [--session NAME] [--ready-timeout-ms MS] [--no-wait] "command"
   ccb steer [--session NAME] "message"
 
   ccb inspect [--session NAME] [--lines N] [--json]
@@ -871,7 +871,7 @@ async function main() {
     // code so a sequential caller cannot proceed into a known non-ready pane.
     const { body, exitCode } = await executeSlash({ session, text, opts });
     console.log(JSON.stringify(body, null, 2));
-    if (exitCode !== 0) process.exit(exitCode);
+    if (exitCode !== 0) process.exitCode = exitCode;
     return;
   }
   if (command === "steer") {
