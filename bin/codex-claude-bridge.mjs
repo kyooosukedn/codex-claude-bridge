@@ -17,6 +17,7 @@ import {
   stripAnsi as stripAnsiLib,
 } from "../lib/pane.mjs";
 import { buildSteerPayload, countLines } from "../lib/steer.mjs";
+import { awaitReadyState } from "../lib/readiness.mjs";
 
 const DEFAULT_SESSION = "codex-claude";
 const DEFAULT_TIMEOUT_MS = 180000;
@@ -25,10 +26,16 @@ const DEFAULT_READY_TIMEOUT_MS = 45000;
 const DEFAULT_INSPECT_LINES = 120;
 const DEFAULT_WATCH_INTERVAL_MS = 1500;
 const DEFAULT_WATCH_TIMEOUT_MS = 600000;
+// Readiness barrier after mode-changing inputs (slash). Bounds how long
+// `ccb slash` waits for the pane to re-render into a fresh idle state before
+// returning. See lib/readiness.mjs and docs/RELIABILITY.md.
+const DEFAULT_MODE_READY_TIMEOUT_MS = 30000;
+const DEFAULT_MODE_READY_INTERVAL_MS = 1000;
 const MSYS_BIN = "C:\\msys64\\usr\\bin";
 const BOOLEAN_FLAGS = new Set([
   "enter",
   "json",
+  "no-wait",
   "remote-control",
   "safe-permissions",
 ]);
@@ -243,6 +250,31 @@ function waitReady(session, timeoutMs = DEFAULT_READY_TIMEOUT_MS) {
     sleep(1000);
   }
   return { ready: false, session, waitedMs: Date.now() - start, tail: last };
+}
+
+// Best-effort pane capture for the readiness baseline. Returns "" on failure so
+// a flaky capture degrades gracefully (the barrier still runs, just without
+// stale-protection for the very first poll) instead of aborting the slash.
+function captureBaseline(session) {
+  try {
+    return captureSession(session, 80);
+  } catch {
+    return "";
+  }
+}
+
+// Drives the pure awaitReadyState barrier against a live session. Used by
+// `ccb slash` to confirm the pane has re-rendered into a fresh idle state after
+// a mode-changing input, defeating the stale `>` false-positive. A capture that
+// throws is caught inside awaitReadyState (reason "capture-error"), so a dying
+// session surfaces as readiness=false rather than crashing the command.
+async function modeReadyBarrier(session, baseline, timeoutMs, intervalMs) {
+  return awaitReadyState({
+    read: async () => captureSession(session, 80),
+    baseline,
+    timeoutMs,
+    intervalMs,
+  });
 }
 
 function inspectSession(session, lines, json) {
@@ -741,7 +773,60 @@ async function main() {
     const slash = opts._.join(" ").trim();
     if (!slash) throw new Error("slash requires command");
     const text = slash.startsWith("/") ? slash : `/${slash}`;
-    console.log(JSON.stringify(enterText(session, text, true), null, 2));
+    // Readiness barrier after a mode-changing input. Capture the pane tail
+    // before delivery, deliver, then wait for the tail to CHANGE and settle
+    // into a fresh idle state. This closes the deterministic
+    // lost-prompt-after-slash gap (the next `ccb send` sees a ready pane) and
+    // defeats the stale `>` false-positive that fooled the old heuristic.
+    // `--no-wait` restores fire-and-forget; output fields are additive only.
+    // Validate flags BEFORE any side effect so a bad --ready-timeout-ms exits
+    // without delivering to the session.
+    const noWait = opts["no-wait"] === true;
+    const readyTimeoutMs = noWait
+      ? DEFAULT_MODE_READY_TIMEOUT_MS
+      : parsePositiveInt(
+          opts["ready-timeout-ms"],
+          DEFAULT_MODE_READY_TIMEOUT_MS,
+          "ready-timeout-ms",
+        );
+    const baseline = captureBaseline(session);
+    const commandId = randomUUID();
+    const injectedAt = new Date().toISOString();
+    const delivered = enterText(session, text, true);
+    let readiness;
+    if (noWait) {
+      readiness = { waited: false, ready: null, reason: "skipped" };
+    } else {
+      const barrier = await modeReadyBarrier(
+        session,
+        baseline,
+        readyTimeoutMs,
+        DEFAULT_MODE_READY_INTERVAL_MS,
+      );
+      readiness = {
+        waited: true,
+        ready: barrier.ready,
+        state: barrier.state,
+        readyAt: barrier.ready ? new Date().toISOString() : null,
+        waitedMs: barrier.waitedMs,
+        attempts: barrier.attempts,
+        reason: barrier.reason,
+        evidence: barrier.evidence,
+      };
+    }
+    console.log(
+      JSON.stringify(
+        {
+          ...delivered,
+          command: text,
+          commandId,
+          injectedAt,
+          readiness,
+        },
+        null,
+        2,
+      ),
+    );
     return;
   }
   if (command === "steer") {

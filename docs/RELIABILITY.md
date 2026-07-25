@@ -76,6 +76,7 @@ These are not theoretical. Each one corresponds to a code path that exists today
 6. **Auth, model, and policy remain Claude-owned.** `ccb` never speaks to the Anthropic API and never modifies Claude Code's authentication, subscription billing, model selection, or policy decisions. If your Anthropic account hits a spending cap, or Claude Code refuses a request for safety reasons, the bridge has no way to override it and no way to surface the underlying error except by classifying the resulting pane state.
 7. **Single-shell invocations.** Each `ccb` call spawns one Node process plus at least one `ccmux` or `tmux` subprocess. There is no long-lived daemon and no streaming output. High-frequency `watch` polling has to budget for that overhead.
 8. **Windows shell quoting.** On Windows, the bridge invokes subprocesses with `shell: true` so that `ccmux` and `tmux` resolve through PowerShell. This is necessary for MSYS2 path translation but means user-supplied strings are passed through one extra layer of shell interpretation. The multiline `steer` path avoids this by writing to a file; `type`, `slash`, and `send` still pass text directly through the shell.
+9. **Readiness barrier is per-command, not a lock.** `ccb slash` now waits for the pane to re-render into a fresh idle state before returning (see _Readiness barrier after slash commands_ below), which closes the deterministic lost-prompt-after-slash gap when callers wait for `slash` to return before issuing `send`. It is not a cross-process session lock: a prompt sent by a concurrent process in the window between `slash` returning and the next `send` injecting can still race. Per-session serialization of `send`/`slash`/`steer` is deferred to a later P1 slice.
 
 ## Failure modes and conservative behaviors
 
@@ -93,6 +94,23 @@ The bridge prefers to refuse over guessing. Concrete failure modes:
 | Numeric flag is zero, negative, non-integer, or NaN                     | Prints `ccb: --<name> must be a positive integer, got: ...` to stderr and exits 2.                                                                                                                            |
 | `ccmux` or `tmux` returns nonzero                                       | The bridge throws with the subprocess's stderr; `main` catches and exits 1.                                                                                                                                   |
 | `ccb patch-ccmux-windows` cannot find the global `core.mjs`             | Throws with a hint to run `pi install npm:claude-code-tmux`.                                                                                                                                                  |
+
+### Readiness barrier after slash commands
+
+A slash command is a mode-changing input. Historically `ccb slash` returned as soon as the text was pasted, so a `ccb send` issued immediately afterward could be lost while the pane was still mid-transition — and the idle `>` marker lingers in scrollback, so even a readiness check could be fooled by stale output. `ccb slash` now applies a readiness barrier:
+
+- Before delivery it captures a baseline fingerprint of the pane tail.
+- After delivery it polls the pane (via `ccmux capture`) until the tail **changes** from the baseline **and** classifies as `idle`, then returns. Requiring a change is what defeats the stale-`>` false-positive.
+- The observed state is reported honestly in the JSON output (`readiness.state`, `readiness.reason`), never inferred as success. A slash that opens a menu surfaces `state: "needs_input"` with `reason: "timeout-not-ready"` rather than claiming ready.
+
+Guarantees and controls:
+
+- **Default timeout:** 30000 ms (`DEFAULT_MODE_READY_TIMEOUT_MS`), polled every 1000 ms. Override with `--ready-timeout-ms <ms>` (positive integer; misuse exits 2).
+- **Escape hatch:** `--no-wait` restores fire-and-forget; the output then carries `readiness: { waited: false, ready: null, reason: "skipped" }`.
+- **Timeout outcomes:** `reason: "timeout-stale"` means the tail never changed (stale output or a frozen pane); `reason: "timeout-not-ready"` means it changed but never settled to idle (e.g. a slash-opened menu); `reason: "capture-error"` means `ccmux capture` failed mid-poll. In every non-ready case delivery still occurred (exit 0) — callers should branch on `readiness.ready`, not on the exit code.
+- **Telemetry:** every `ccb slash` result carries `commandId`, `injectedAt`, and (when waited) `readiness.readyAt`, `waitedMs`, `attempts`, `reason`, and `evidence` for audit.
+
+Scope: `send` and `steer` are unchanged in this slice; the barrier lives on `slash` because that is where the mode-changing gap was reproduced.
 
 ### Exit codes
 
