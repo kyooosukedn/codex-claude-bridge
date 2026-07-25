@@ -342,16 +342,16 @@ The broker does not implement its own roster; it relies on native roster persist
 
 ### Claude auth and billing
 
-The broker never speaks to the Anthropic API. Authentication, subscription or usage billing, model selection, and safety policy remain entirely controlled by Claude Code and the operator's Anthropic account configuration. If the account hits a spending cap, or Claude refuses for policy reasons, the broker has no override; it surfaces the resulting `Stop`/`StopFailure` event and lets the operator decide.
+The broker never speaks to the Anthropic API. Authentication, subscription or usage billing, model selection, and safety policy remain entirely controlled by Claude Code and the operator's account configuration. Channels specifically require Anthropic authentication through claude.ai or a Console API key; third-party provider sessions are not eligible. If authentication is ineligible, the account hits a spending cap, or Claude refuses for policy reasons, the broker has no override and must report the condition.
 
 ### Channel consent
 
-Consent behavior for the custom development channel is **not verified**. Two distinct consent concepts exist and must not be conflated:
+The 2026-07-24 R0 run could not reach consent because the current GLM/API-billing session is ineligible for Channels. Two distinct gates must not be conflated:
 
 1. **Project MCP consent** — Claude's standard prompt to approve MCP servers referenced by a project. This is well-understood and handled by Claude's normal MCP onboarding.
-2. **Development-channel warning** — the research-preview notice for custom channels. Whether this warning appears once per session, once per installation, or not at all in `--bg` mode is unknown as of this writing.
+2. **Channel eligibility and development warning** — Channels require Anthropic authentication via claude.ai or a Console API key. Only after eligibility passes can the research-preview warning be tested.
 
-The R0 spike (see [Rollout phases](#rollout-phases)) must discover the actual behavior before any code depends on a specific flow. Until then, the broker infers `consent_pending` only from observed startup/status signals (e.g., `ccb-channel-server` not connecting within a startup window, or a `SessionStart` without a subsequent channel connection). The broker does **not** assume a documented `consent_granted` event exists.
+An MCP stdio connection is not proof that Claude accepted the server as a channel: the failed R0 run connected `ccb-channel-server` while Claude ignored the development-channel flag and silently dropped notifications. Future detection must require a rendered channel-registration signal or an end-to-end delivery probe. The broker does **not** assume a documented `consent_granted` event exists.
 
 ### Permission relay integrity
 
@@ -522,6 +522,8 @@ An R0 spike gates everything else. Channel viability is a go/no-go decision befo
 
 ### R0 — Channel feasibility spike (mandatory, go/no-go)
 
+**2026-07-24 result: NO-GO on current host authentication.** Claude `2.1.218` ran through `glm-5.2` API billing. Interactive launch reported `--dangerously-load-development-channels ignored` and `Channels are not currently available`. The MCP subprocess connected, but injected notifications were dropped and no reply arrived. R2+ is blocked until Claude is authenticated through claude.ai or a Console API key and R0 is rerun.
+
 1. Upgrade Claude to the latest stable (test target: `>= 2.1.212`, the version where structured `waitingFor` is available).
 2. Start a session with `claude --bg --name spike-1`.
 3. Register the custom development channel and spawn `ccb-channel-server` over stdio.
@@ -635,7 +637,7 @@ V2 is acceptable for R5 (default transport) when **all** of the following are tr
 
 ## Remaining uncertainty
 
-- **Channel consent flow.** Whether `claude --bg --name` accepts a custom development channel without interactive consent, or whether the operator must `claude attach` and run `/background` once, is unknown. The R0 spike is designed to answer this. Until it does, the `consent_pending` state and the consent-grant path are inferred from observed behavior, not from a documented event.
-- **Channel injection semantics.** Whether `notifications/claude/channel` delivers a message that interrupts an in-flight tool call (true mid-turn steering) or only delivers between turns (queued message delivery) is unknown. The spec describes it as queued delivery and directs exact-control use cases to native-attach. The R0 spike should confirm which model the channel implements.
-- **Native state subtypes.** Whether `blocked` + `waitingFor` reliably distinguishes permission prompts from generic input needs, sandbox gates, and dialogs across all tool types is unknown until live smoke runs against real permission popups on all three platforms.
+- **Channel eligibility and consent flow.** Current GLM/API-billing authentication is ineligible. Rerun with claude.ai or Console API-key authentication before testing whether `--bg` accepts a development channel without interactive consent.
+- **Channel injection semantics.** The ineligible run proves only silent dropping: MCP emitted `notifications/claude/channel`, but Claude did not render or process it. Queued versus mid-turn delivery remains unknown until an eligible rerun.
+- **Native state subtypes.** Claude `2.1.218` returned lifecycle `state: "blocked"` with secondary `status: "idle"` and no `waitingFor` during the failed injection run. The adapter now gives lifecycle state precedence and maps blocked-without-subtype to `unknown`; permission/input subtype reliability remains unverified.
 - **Respawn conversation integrity.** `claude respawn <id>` is documented as conversation-intact, but the broker should verify this by reading the post-respawn transcript during smoke. If integrity is partial (e.g., tool history preserved but not visible context), the spec's respawn acceptance criterion may need adjustment.
