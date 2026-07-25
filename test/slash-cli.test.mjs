@@ -82,6 +82,24 @@ test("cli: invalid --ready-timeout-ms exits 2 BEFORE any ccmux side effect", () 
   assert.equal(readLog(logPath), "", "no ccmux call may happen before flag validation");
 });
 
+test("cli: invalid send --timeout-ms exits 2 before session startup", () => {
+  const { logPath, env } = makeCcmuxStub();
+  const r = runCcb(["send", "--timeout-ms", "NaN", "work"], env);
+
+  assert.equal(r.status, 2, `expected exit 2, got ${r.status}\nstderr: ${r.stderr}`);
+  assert.match(r.stderr, /--timeout-ms .*positive integer/);
+  assert.equal(readLog(logPath), "", "no ccmux call may happen before flag validation");
+});
+
+test("cli: invalid send --settle-ms exits 2 before session startup", () => {
+  const { logPath, env } = makeCcmuxStub();
+  const r = runCcb(["send", "--settle-ms", "0", "work"], env);
+
+  assert.equal(r.status, 2, `expected exit 2, got ${r.status}\nstderr: ${r.stderr}`);
+  assert.match(r.stderr, /--settle-ms .*positive integer/);
+  assert.equal(readLog(logPath), "", "no ccmux call may happen before flag validation");
+});
+
 test("cli: missing slash text exits 1", () => {
   const r = runCcb(["slash"]);
   assert.equal(r.status, 1, `expected exit 1, got ${r.status}`);

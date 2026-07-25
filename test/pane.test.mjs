@@ -231,6 +231,25 @@ test("regression: Windows steer load-buffer patch present in bridge source", asy
   );
 });
 
+test("regression: Windows Claude launch survives a fresh Bash-backed tmux server", async () => {
+  const binPath = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "bin",
+    "codex-claude-bridge.mjs",
+  );
+  const src = await readFile(binPath, "utf8");
+
+  assert.ok(
+    src.includes('Buffer.from(script, "utf16le").toString("base64")'),
+    "Windows patch must encode the PowerShell script without shell quoting",
+  );
+  assert.ok(
+    src.includes("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand"),
+    "tmux must launch an explicit PowerShell executable from its Bash shell",
+  );
+});
+
 // ---- Codex review fixes (regression coverage) ----
 
 test("regression: healthy session with hook errors classifies as idle, not crashed", () => {
