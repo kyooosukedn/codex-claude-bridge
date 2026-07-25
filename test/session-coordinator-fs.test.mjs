@@ -17,10 +17,12 @@ import os from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
+  acquireSessionLock,
   createFileLockStore,
   DEFAULT_LOCK_DIR,
   DEFAULT_PRE_WRITE_ATTEMPTS,
 } from "../lib/session-coordinator.mjs";
+import { setTimeout as sleep } from "node:timers/promises";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LIB_URL = pathToFileURL(path.resolve(HERE, "../lib/session-coordinator.mjs")).href;
@@ -138,7 +140,7 @@ process.stdout.write(JSON.stringify(r));
   await fs.rm(dir, { recursive: true, force: true });
 });
 
-test("rename moves one generation and never overwrites a quarantine target", async () => {
+test("hard-link claim identifies one generation and never overwrites quarantine", async () => {
   const dir = await mkLockDir();
   const canonical = path.join(dir, "reviewer.lock");
   const quarantine = path.join(dir, "reviewer.lock.dead-1.quarantine");
@@ -146,32 +148,30 @@ test("rename moves one generation and never overwrites a quarantine target", asy
 
   await store.createExclusive(canonical, sampleRecord());
 
-  const renamed = await store.rename(canonical, quarantine);
-  assert.equal(renamed.renamed, true);
-  assert.equal(await store.read(canonical), null);
+  const claimed = await store.claimDeadGeneration(canonical, quarantine);
+  assert.equal(claimed.claimed, true);
+  assert.equal((await store.read(canonical)).ownerToken, "owner-1");
   const quarantined = await store.read(quarantine);
   assert.equal(quarantined.ownerToken, "owner-1");
 
   // Re-seed and pre-create the quarantine target: rename must refuse.
-  await store.createExclusive(canonical, sampleRecord({ ownerToken: "owner-2" }));
-  await fs.writeFile(quarantine, "blocker", { mode: 0o600 });
-  const refused = await store.rename(canonical, quarantine);
-  assert.equal(refused.renamed, false);
+  const refused = await store.claimDeadGeneration(canonical, quarantine);
+  assert.equal(refused.claimed, false);
   // Canonical untouched because rename refused to overwrite the quarantine.
-  assert.equal((await store.read(canonical)).ownerToken, "owner-2");
+  assert.equal((await store.read(canonical)).ownerToken, "owner-1");
 
   await fs.rm(dir, { recursive: true, force: true });
 });
 
-test("rename refuses a quarantine name that escapes the lock directory", async () => {
+test("hard-link claim refuses a quarantine name that escapes the lock directory", async () => {
   const dir = await mkLockDir();
   const canonical = path.join(dir, "reviewer.lock");
   const escape = path.join(dir, "..", "escaped.quarantine");
   const store = createFileLockStore({ lockDir: dir });
 
   await store.createExclusive(canonical, sampleRecord());
-  const refused = await store.rename(canonical, escape);
-  assert.equal(refused.renamed, false);
+  const refused = await store.claimDeadGeneration(canonical, escape);
+  assert.equal(refused.claimed, false);
   // Canonical still present; nothing escaped the directory.
   assert.equal((await store.read(canonical)).ownerToken, "owner-1");
   await assert.rejects(() => fs.readFile(path.join(dir, "..", "escaped.quarantine")));
@@ -221,4 +221,207 @@ test("unlinkIfOwner refuses missing, malformed, and mismatched records", async (
   assert.equal((await store.unlinkIfOwner(canonical, "owner-1", "command-1")).unlinked, false);
 
   await fs.rm(dir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// Task 3: acquire and dead-owner recovery against the real filesystem.
+// ---------------------------------------------------------------------------
+
+const NOW = () => new Date("2026-07-25T12:00:00.000Z");
+
+test("acquire creates a fresh lock via O_EXCL", async () => {
+  const dir = await mkLockDir();
+  const store = createFileLockStore({ lockDir: dir });
+  const result = await acquireSessionLock({
+    session: "reviewer",
+    commandId: "command-1",
+    commandClass: "prompt",
+    pid: 4321,
+    lockDir: dir,
+    store,
+    isProcessAlive: async () => "live",
+    randomUUID: () => "owner-1",
+    now: NOW,
+  });
+  assert.equal(result.acquired, true);
+  assert.equal(result.reason, "created");
+  assert.equal(result.recovered, false);
+  assert.equal(result.priorPhase, null);
+  assert.equal(result.ownerToken, "owner-1");
+  assert.equal(result.commandId, "command-1");
+  assert.equal(result.lockPath, path.join(dir, "reviewer.lock"));
+  const record = await store.read(result.lockPath);
+  assert.equal(record.phase, "pre-write");
+  assert.equal(record.pid, 4321);
+  assert.equal(record.session, "reviewer");
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("acquire reports live-owner and does not recover", async () => {
+  const dir = await mkLockDir();
+  const store = createFileLockStore({ lockDir: dir });
+  const first = await acquireSessionLock({
+    session: "reviewer", commandId: "command-1", commandClass: "prompt",
+    pid: 4321, lockDir: dir, store,
+    isProcessAlive: async () => "live", randomUUID: () => "owner-1", now: NOW,
+  });
+  assert.equal(first.acquired, true);
+
+  const second = await acquireSessionLock({
+    session: "reviewer", commandId: "command-2", commandClass: "prompt",
+    pid: 9999, lockDir: dir, store,
+    isProcessAlive: async (pid) => (pid === 4321 ? "live" : "dead"),
+    randomUUID: () => "owner-2", now: NOW,
+  });
+  assert.equal(second.acquired, false);
+  assert.equal(second.reason, "live-owner");
+  assert.equal(second.heldBy.pid, 4321);
+  assert.equal(second.heldBy.commandId, "command-1");
+  assert.equal((await store.read(first.lockPath)).ownerToken, "owner-1");
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("acquire treats unknown liveness as non-reclaimable", async () => {
+  const dir = await mkLockDir();
+  const store = createFileLockStore({ lockDir: dir });
+  await acquireSessionLock({
+    session: "reviewer", commandId: "command-1", commandClass: "prompt",
+    pid: 4321, lockDir: dir, store,
+    isProcessAlive: async () => "live", randomUUID: () => "owner-1", now: NOW,
+  });
+  // EPERM-style uncertainty maps to "unknown" and must fail closed.
+  const result = await acquireSessionLock({
+    session: "reviewer", commandId: "command-2", commandClass: "prompt",
+    pid: 9999, lockDir: dir, store,
+    isProcessAlive: async () => "unknown", randomUUID: () => "owner-2", now: NOW,
+  });
+  assert.equal(result.acquired, false);
+  assert.equal(result.reason, "unknown-owner");
+  assert.equal(result.heldBy.pid, 4321);
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("acquire recovers a definitely dead owner via quarantine + fresh O_EXCL", async () => {
+  const dir = await mkLockDir();
+  const store = createFileLockStore({ lockDir: dir });
+  const canonical = path.join(dir, "reviewer.lock");
+  // Seed a dead-owner generation directly.
+  await store.createExclusive(canonical, sampleRecord({
+    session: "reviewer", ownerToken: "dead", pid: 4321,
+    commandId: "dead-cmd", phase: "pre-write",
+  }));
+
+  const result = await acquireSessionLock({
+    session: "reviewer", commandId: "command-2", commandClass: "prompt",
+    pid: 9999, lockDir: dir, store,
+    isProcessAlive: async () => "dead",
+    randomUUID: () => "new-owner", now: NOW,
+  });
+  assert.equal(result.acquired, true);
+  assert.equal(result.reason, "recovered-dead-owner");
+  assert.equal(result.recovered, true);
+  assert.equal(result.priorPhase, "pre-write");
+  assert.equal(result.ownerToken, "new-owner");
+  assert.equal(result.commandId, "command-2");
+  // Canonical now owned by the recoverer; dead generation quarantined.
+  assert.equal((await store.read(canonical)).ownerToken, "new-owner");
+  assert.ok(result.quarantinePath, "quarantine path returned");
+  assert.notEqual(result.quarantinePath, canonical);
+  const quarantined = await store.read(result.quarantinePath);
+  assert.equal(quarantined.ownerToken, "dead");
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("concurrent dead-owner recovery yields exactly one new owner", async () => {
+  const dir = await mkLockDir();
+  const canonical = path.join(dir, "race.lock");
+  const goFile = path.join(dir, "GO");
+  const store = createFileLockStore({ lockDir: dir });
+  // The dead owner's pid is a sentinel no live child will hold. Each contender
+  // runs with its own real process.pid, so isProcessAlive (below) reports the
+  // dead owner as dead and every fellow contender as live — exactly what
+  // production process.kill(pid,0) would observe. This isolates the rename +
+  // O_EXCL race instead of cascading recovery onto live contenders.
+  const deadPid = 2147483647;
+  await store.createExclusive(canonical, sampleRecord({
+    session: "race", ownerToken: "dead", pid: deadPid,
+    commandId: "dead-cmd", phase: "pre-write",
+  }));
+
+  const N = 8;
+  const childScript = (i) => `
+const { acquireSessionLock, createFileLockStore } = await import(${JSON.stringify(LIB_URL)});
+const fs = await import("node:fs/promises");
+const { setTimeout: sleep } = await import("node:timers/promises");
+const dir = ${JSON.stringify(dir)};
+const goFile = ${JSON.stringify(goFile)};
+const readyFile = ${JSON.stringify(path.join(dir, `ready-${i}`))};
+const deadPid = ${deadPid};
+await fs.writeFile(readyFile, "", { mode: 0o600 });
+for (;;) { try { await fs.access(goFile); break; } catch { await sleep(5); } }
+const store = createFileLockStore();
+const result = await acquireSessionLock({
+  session: "race",
+  commandId: ${JSON.stringify(`cmd-${i}`)},
+  commandClass: "prompt",
+  pid: process.pid,
+  lockDir: dir,
+  store,
+  isProcessAlive: async (pid) => (pid === deadPid ? "dead" : "live"),
+  randomUUID: () => ${JSON.stringify(`owner-${i}`)},
+  now: () => new Date("2026-07-25T12:00:00.000Z"),
+});
+process.stdout.write(JSON.stringify(result));
+`;
+
+  const pending = Array.from({ length: N }, (_, i) => runChild(childScript(i)));
+  // Wait until every child is parked on the barrier, then release them together.
+  await Promise.all(Array.from({ length: N }, async (_, i) => {
+    const readyFile = path.join(dir, `ready-${i}`);
+    for (;;) {
+      try { await fs.access(readyFile); break; } catch { await sleep(10); }
+    }
+  }));
+  await fs.writeFile(goFile, "", { mode: 0o600 });
+
+  const results = await Promise.all(
+    pending.map((p) => p.then(({ out }) => JSON.parse(out))),
+  );
+
+  const winners = results.filter((r) => r.acquired);
+  assert.equal(winners.length, 1, `expected one winner, got ${winners.length}`);
+  const winner = winners[0];
+  assert.equal(winner.recovered, true);
+  assert.equal(winner.priorPhase, "pre-write");
+
+  // Canonical metadata equals the O_EXCL winner — not any rename-only contender.
+  const canonicalRecord = await store.read(canonical);
+  assert.equal(canonicalRecord.ownerToken, winner.ownerToken);
+  assert.equal(canonicalRecord.commandId, winner.commandId);
+
+  // No contender reports ownership merely because it won the rename: any
+  // contender that entered recovery (set a quarantinePath) but did not win the
+  // fresh O_EXCL reports contended, never acquired.
+  for (const r of results) {
+    if (r.quarantinePath && !r.acquired) {
+      assert.equal(r.reason, "contended");
+    }
+  }
+
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("acquire lazily creates a missing lock directory", async () => {
+  const root = await mkLockDir();
+  const freshDir = path.join(root, "nested", "locks");
+  const store = createFileLockStore();
+  const result = await acquireSessionLock({
+    session: "reviewer", commandId: "command-1", commandClass: "prompt",
+    pid: 4321, lockDir: freshDir, store,
+    isProcessAlive: async () => "live", randomUUID: () => "owner-1", now: NOW,
+  });
+  assert.equal(result.acquired, true);
+  assert.equal(result.reason, "created");
+  assert.equal((await store.read(path.join(freshDir, "reviewer.lock"))).ownerToken, "owner-1");
+  await fs.rm(root, { recursive: true, force: true });
 });
