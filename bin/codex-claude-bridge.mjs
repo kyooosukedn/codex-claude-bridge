@@ -5,12 +5,13 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import {
   classifyPane,
   selectOption,
@@ -966,8 +967,18 @@ async function main() {
 }
 
 // Run main() only when executed directly, not when imported (e.g. by tests).
-const isMainModule =
-  import.meta.url === pathToFileURL(process.argv[1] || "").href;
+// Resolve both paths through symlinks/junctions because npm link invokes this
+// file through its global package junction while import.meta.url uses the real
+// repository path.
+let isMainModule = false;
+if (process.argv[1]) {
+  try {
+    isMainModule =
+      realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]);
+  } catch {
+    // A missing/unresolvable argv path cannot be this module's entry point.
+  }
+}
 if (isMainModule) {
   main().catch((error) => {
     console.error(error.message || String(error));
