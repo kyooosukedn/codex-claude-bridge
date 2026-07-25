@@ -18,7 +18,8 @@ import {
   stripAnsi as stripAnsiLib,
 } from "../lib/pane.mjs";
 import { buildSteerPayload, countLines } from "../lib/steer.mjs";
-import { awaitReadyState } from "../lib/readiness.mjs";
+import { awaitReadyState, paneSignature } from "../lib/readiness.mjs";
+import { coordinateInjection } from "../lib/session-coordinator.mjs";
 
 const DEFAULT_SESSION = "codex-claude";
 const DEFAULT_TIMEOUT_MS = 180000;
@@ -367,6 +368,264 @@ export async function executeSlash({ session, text, opts, deps = defaultSlashDep
   return {
     body: { ...delivered, command: text, commandId, injectedAt, readiness },
     exitCode: barrier.ready ? 0 : SLASH_NOT_READY_EXIT,
+  };
+}
+
+function parseCcmuxJob(stdout, session) {
+  let job;
+  try {
+    job = JSON.parse(String(stdout || "").trim());
+  } catch {
+    throw new Error("ccmux send returned malformed JSON");
+  }
+  if (
+    !job ||
+    typeof job.id !== "string" ||
+    !job.id ||
+    job.session !== session ||
+    job.status !== "sent" ||
+    Number.isNaN(Date.parse(job.sentAt))
+  ) {
+    throw new Error("ccmux send returned invalid job acknowledgment");
+  }
+  return job;
+}
+
+function parseCcmuxTerminal(stdout, jobId, session) {
+  let terminal;
+  try {
+    terminal = JSON.parse(String(stdout || "").trim());
+  } catch {
+    throw new Error("ccmux wait returned malformed JSON");
+  }
+  if (
+    !terminal ||
+    terminal.id !== jobId ||
+    terminal.session !== session ||
+    !["sent", "done", "timeout"].includes(terminal.status)
+  ) {
+    throw new Error("ccmux wait returned invalid terminal state");
+  }
+  return terminal;
+}
+
+async function observePaneInjection({
+  session,
+  baseline,
+  timeoutMs = 5000,
+  intervalMs = 100,
+  capture = captureSession,
+  now = Date.now,
+  wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+}) {
+  const start = now();
+  const baselineSig = paneSignature(baseline);
+  do {
+    const pane = capture(session, 80);
+    const state = classifyPane(pane).state;
+    if (paneSignature(pane) !== baselineSig) {
+      return { observed: true, reason: state === "thinking" ? "thinking" : "pane-changed", state };
+    }
+    if (now() - start >= timeoutMs) break;
+    await wait(intervalMs);
+  } while (true);
+  return { observed: false, reason: "injection-not-observed" };
+}
+
+function defaultCommandDeps() {
+  return {
+    coordinateInjection,
+    capture: (session) => captureSession(session, 80),
+    send: (session, prompt) => must("ccmux", ["send", "--session", session, prompt]),
+    waitJob: (jobId, timeoutMs, settleMs) =>
+      must("ccmux", [
+        "wait",
+        jobId,
+        "--timeout-ms",
+        String(timeoutMs),
+        "--settle-ms",
+        String(settleMs),
+      ]),
+    observe: observePaneInjection,
+    enterText,
+    steerMessage,
+    modeReadyBarrier,
+    now: () => new Date(),
+  };
+}
+
+function coordinatorFailureExit(ack) {
+  if (ack === "busy") return 8;
+  if (ack === "not-injected") return SLASH_BASELINE_FAILED_EXIT;
+  return 9;
+}
+
+export async function executeSend({
+  session,
+  prompt,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  settleMs = 3000,
+  deps = defaultCommandDeps(),
+}) {
+  const commandId = randomUUID();
+  const coordinated = await deps.coordinateInjection({
+    session,
+    commandId,
+    commandClass: "prompt",
+    pid: process.pid,
+    maxPreWriteAttempts: 1,
+    now: deps.now,
+    captureBaseline: () => deps.capture(session),
+    inject: () => parseCcmuxJob(deps.send(session, prompt), session),
+    observeInjection: ({ baseline, payload }) =>
+      deps.observe({ session, baseline, payload }),
+  });
+
+  if (coordinated.ack !== "injected") {
+    return { body: coordinated, exitCode: coordinatorFailureExit(coordinated.ack) };
+  }
+
+  let terminal;
+  try {
+    terminal = parseCcmuxTerminal(
+      deps.waitJob(coordinated.payload.id, timeoutMs, settleMs),
+      coordinated.payload.id,
+      session,
+    );
+  } catch (error) {
+    return {
+      body: {
+        terminal: {
+          status: "unknown",
+          reason: "wait-error",
+          error: error.message,
+        },
+        coordinator: coordinated,
+      },
+      exitCode: 9,
+    };
+  }
+  return {
+    body: { ...terminal, coordinator: coordinated },
+    exitCode: terminal?.status === "timeout" ? 5 : 0,
+  };
+}
+
+export async function executeCoordinatedSlash({
+  session,
+  text,
+  opts,
+  deps = defaultCommandDeps(),
+}) {
+  const commandId = randomUUID();
+  const noWait = opts["no-wait"] === true;
+  const readyTimeoutMs = noWait
+    ? 0
+    : parsePositiveInt(
+        opts["ready-timeout-ms"],
+        DEFAULT_MODE_READY_TIMEOUT_MS,
+        "ready-timeout-ms",
+      );
+  const coordinated = await deps.coordinateInjection({
+    session,
+    commandId,
+    commandClass: "mode-changing",
+    pid: process.pid,
+    maxPreWriteAttempts: 1,
+    now: deps.now,
+    captureBaseline: () => (noWait ? "" : deps.capture(session)),
+    inject: async ({ baseline }) => {
+      const delivered = deps.enterText(session, text, true);
+      const injectedAt = deps.now().toISOString();
+      if (noWait) {
+        return {
+          ...delivered,
+          command: text,
+          commandId,
+          injectedAt,
+          readiness: { waited: false, ready: null, reason: "skipped" },
+          exitCode: 0,
+        };
+      }
+      const barrier = await deps.modeReadyBarrier(
+        session,
+        baseline,
+        readyTimeoutMs,
+        DEFAULT_MODE_READY_INTERVAL_MS,
+      );
+      return {
+        ...delivered,
+        command: text,
+        commandId,
+        injectedAt,
+        readiness: {
+          waited: true,
+          ready: barrier.ready,
+          state: barrier.state,
+          readyAt: barrier.ready ? deps.now().toISOString() : null,
+          reason: barrier.reason,
+          waitedMs: barrier.waitedMs,
+          attempts: barrier.attempts,
+          evidence: barrier.evidence,
+        },
+        exitCode: barrier.ready ? 0 : SLASH_NOT_READY_EXIT,
+      };
+    },
+    observeInjection: ({ payload }) => ({
+      observed: true,
+      reason: payload.readiness?.reason || "transport-returned",
+    }),
+  });
+  if (coordinated.ack !== "injected") {
+    if (coordinated.ack === "not-injected") {
+      return {
+        body: {
+          command: text,
+          commandId,
+          readiness: {
+            waited: true,
+            ready: false,
+            reason: "baseline-capture-failed",
+            evidence: { captureError: coordinated.error },
+          },
+          coordinator: coordinated,
+        },
+        exitCode: SLASH_BASELINE_FAILED_EXIT,
+      };
+    }
+    return {
+      body: coordinated,
+      exitCode: coordinatorFailureExit(coordinated.ack),
+    };
+  }
+  return {
+    body: { ...coordinated.payload, coordinator: coordinated },
+    exitCode: coordinated.payload.exitCode,
+  };
+}
+
+export async function executeSteer({
+  session,
+  message,
+  deps = defaultCommandDeps(),
+}) {
+  const coordinated = await deps.coordinateInjection({
+    session,
+    commandId: randomUUID(),
+    commandClass: "steer",
+    pid: process.pid,
+    maxPreWriteAttempts: 1,
+    now: deps.now,
+    captureBaseline: () => deps.capture(session),
+    inject: () => deps.steerMessage(session, message),
+    observeInjection: () => ({ observed: true, reason: "transport-returned" }),
+  });
+  return {
+    body: coordinated,
+    exitCode:
+      coordinated.ack === "injected"
+        ? 0
+        : coordinatorFailureExit(coordinated.ack),
   };
 }
 
@@ -779,15 +1038,22 @@ export function msysPathForShell(value) {
     );
   }
 
-  src = src.replace(
-    /const command = argv\.map\(shellQuote\)\.join\(" "\);\r?\n\s*return process\.platform === "win32" \? `& \$\{command\}` : command;/g,
-    `const command = argv.map(shellQuote).join(" ");
-  if (process.platform === "win32") {
+  const encodedWindowsCommand = `const command = argv.map(shellQuote).join(" ");
+if (process.platform === "win32") {
     const cwdPrefix = options.cwd ? \`Set-Location -LiteralPath \${shellQuote(options.cwd)}; \` : "";
     const authPrefix = "Get-ChildItem Env:ANTHROPIC* | Remove-Item -ErrorAction SilentlyContinue; ";
-    return \`\${authPrefix}\${cwdPrefix}& \${command}\`;
+    const script = \`\${authPrefix}\${cwdPrefix}& \${command}\`;
+    const encoded = Buffer.from(script, "utf16le").toString("base64");
+    return \`powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand \${encoded}\`;
   }
-  return command;`,
+return command;`;
+  src = src.replace(
+    /const command = argv\.map\(shellQuote\)\.join\(" "\);\r?\n\s*return process\.platform === "win32" \? `& \$\{command\}` : command;/g,
+    encodedWindowsCommand,
+  );
+  src = src.replace(
+    /const command = argv\.map\(shellQuote\)\.join\(" "\);\r?\n\s*if \(process\.platform === "win32"\) \{[\s\S]*?const authPrefix = "Get-ChildItem Env:ANTHROPIC\* \| Remove-Item -ErrorAction SilentlyContinue; ";\r?\n\s*return `\$\{authPrefix\}\$\{cwdPrefix\}& \$\{command\}`;\r?\n\s*\}\r?\n\s*return command;/g,
+    encodedWindowsCommand,
   );
 
   if (src !== original) writeFileSync(file, src);
@@ -843,17 +1109,26 @@ async function main() {
   if (command === "send") {
     const prompt = opts._.join(" ").trim();
     if (!prompt) throw new Error("send requires prompt");
+    const timeoutMs = parsePositiveInt(
+      opts["timeout-ms"],
+      DEFAULT_TIMEOUT_MS,
+      "timeout-ms",
+    );
+    const settleMs = parsePositiveInt(opts["settle-ms"], 3000, "settle-ms");
     ensureSession({
       session,
       cwd,
       opts,
       startupWaitMs: Number(opts["startup-wait-ms"] || DEFAULT_STARTUP_WAIT_MS),
     });
-    const timeout = String(opts["timeout-ms"] || DEFAULT_TIMEOUT_MS);
-    const args = ["send", "--session", session, "--wait", "--timeout-ms", timeout];
-    if (opts["settle-ms"]) args.push("--settle-ms", String(opts["settle-ms"]));
-    args.push(prompt);
-    process.stdout.write(must("ccmux", args));
+    const { body, exitCode } = await executeSend({
+      session,
+      prompt,
+      timeoutMs,
+      settleMs,
+    });
+    console.log(JSON.stringify(body, null, 2));
+    if (exitCode !== 0) process.exitCode = exitCode;
     return;
   }
   if (command === "type") {
@@ -870,7 +1145,7 @@ async function main() {
     // injectedAt, and exit codes) lives in executeSlash so it is unit-testable.
     // main() always prints the telemetry body, then propagates a nonzero exit
     // code so a sequential caller cannot proceed into a known non-ready pane.
-    const { body, exitCode } = await executeSlash({ session, text, opts });
+    const { body, exitCode } = await executeCoordinatedSlash({ session, text, opts });
     console.log(JSON.stringify(body, null, 2));
     if (exitCode !== 0) process.exitCode = exitCode;
     return;
@@ -878,7 +1153,9 @@ async function main() {
   if (command === "steer") {
     const message = opts._.join(" ").trim();
     if (!message) throw new Error("steer requires message");
-    console.log(JSON.stringify(steerMessage(session, message), null, 2));
+    const { body, exitCode } = await executeSteer({ session, message });
+    console.log(JSON.stringify(body, null, 2));
+    if (exitCode !== 0) process.exitCode = exitCode;
     return;
   }
   if (command === "key") {
