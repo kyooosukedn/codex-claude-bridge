@@ -125,15 +125,18 @@ that writer. Therefore timeout-based stealing cannot be made safe here.
 
 When the owner is definitely dead:
 
-1. Atomically rename the canonical lockfile to a unique quarantine path.
-2. If rename fails because another contender moved it, restart acquisition.
-3. Attempt a normal fresh `O_EXCL` acquire at the canonical path.
-4. The process that performed the rename has no priority. Any contender may win
-   the fresh acquire, and exactly one can win.
-5. Preserve quarantine metadata for diagnostics until bounded cleanup.
+1. Derive a deterministic quarantine path from the dead owner's token.
+2. Atomically create a hard link from canonical to quarantine. Link creation is
+   no-overwrite: exactly one contender can claim that dead generation.
+3. Only the link winner verifies the quarantine record and unlinks canonical.
+4. Attempt a normal fresh `O_EXCL` acquire at the canonical path.
+5. Preserve the quarantine hard link as a generation tombstone.
 
-The rename removes the dead generation. `O_EXCL` creates the new generation.
-There is no unconditional overwrite and no read-then-replace claim.
+The hard-link claim prevents a slow contender from moving a newer canonical
+owner. A unique-path rename does not: a contender can read the dead generation,
+pause, then rename a fresh owner's file. A pre-check plus POSIX `rename` also
+cannot provide no-overwrite atomically. Hard-link creation provides the required
+generation claim on NTFS and POSIX filesystems.
 
 ## Release
 
@@ -245,7 +248,7 @@ Contract tests must prove:
 - public ccmux `send` and `wait` occur on opposite sides of release
 
 At least one test must use real child processes and the production filesystem
-store. In-memory tests alone cannot prove `O_EXCL` or rename behavior.
+store. In-memory tests alone cannot prove `O_EXCL` or hard-link behavior.
 
 ## Consequences
 
