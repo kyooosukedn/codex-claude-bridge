@@ -5,11 +5,14 @@ import "@fontsource/ibm-plex-mono/500.css";
 import "@fontsource/ibm-plex-mono/600.css";
 import "./globals.css";
 
+const publicSiteUrl =
+  "https://kyooosukedn.github.io/codex-claude-bridge";
+
 export const metadata: Metadata = {
   title: "Codex Claude Bridge",
   description:
     "Control persistent Claude Code sessions from Codex. Send work, steer mid-run, inspect state, and keep the conversation alive.",
-  metadataBase: new URL("https://codex-claude-bridge.openai.site"),
+  metadataBase: new URL(publicSiteUrl),
   openGraph: {
     title: "Codex Claude Bridge",
     description:
@@ -17,7 +20,7 @@ export const metadata: Metadata = {
     type: "website",
     images: [
       {
-        url: "/og.png",
+        url: `${publicSiteUrl}/og.png`,
         width: 1200,
         height: 630,
         alt: "Codex and Claude Code connected through a session-lock relay",
@@ -29,7 +32,7 @@ export const metadata: Metadata = {
     title: "Codex Claude Bridge",
     description:
       "A local-first control plane for persistent Claude Code sessions.",
-    images: ["/og.png"],
+    images: [`${publicSiteUrl}/og.png`],
   },
 };
 
