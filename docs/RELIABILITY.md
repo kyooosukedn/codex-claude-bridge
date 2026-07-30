@@ -6,13 +6,13 @@ An honest accounting of what `ccb` does well, what it does poorly, and what woul
 
 **Assessment: early. Usable for careful, supervised automation. Not yet production-grade.**
 
-The robustness work in this area landed in a single development session. The core happy paths (capture, classify idle/thinking/done, send/steer to a known session, refuse unsafe approvals) are exercised both by automated tests and by live smoke against real `tmux` sessions. The riskier paths (real permission popups, crash recovery, non-Windows platforms) are covered by synthetic fixtures only.
+The robustness work in this area landed in a single development session. The core happy paths (capture, classify idle/thinking/done, send/steer to a known session, refuse unsafe approvals) are exercised both by automated tests and by live smoke against real `tmux` sessions. Bridge-process crash recovery is covered by deterministic real-child tests at the queued/pre-write, injecting, and acknowledged/released (running) boundaries; real permission popups, a live `claude`/`tmux` kill-and-restart, and non-Windows platforms are still covered by synthetic fixtures or runbook only.
 
 You should treat `ccb` the way you would treat any other terminal automation tool: useful for the loops it handles, but not something to leave running unattended against a session you care about until you have personally verified your specific usage on your specific platform.
 
 ### What was verified, by whom, when
 
-- **Automated tests**: 119 main tests passed on Windows on 2026-07-30. The native-channel suite remains a separate 40-test gate. This is a dated snapshot; `npm run check` is canonical.
+- **Automated tests**: 258 main tests passed on Windows on 2026-07-30 (including the P1 stress/fault harness: streaming token observation, delivery-aware verdict, single-token prompt, bounded readiness, child-process fault recovery, 3-session isolation, the slash autocomplete confirmation, the pre-injection idle baseline gate, and the post-injection idle→active observer fix). The native-channel suite is a separate 40-test gate; on 2026-07-30 `npm run check` ran both (258 main + 40 native) with `git diff --check` clean. This is a dated snapshot; `npm run check` is canonical.
 
   | Area                                | Tests | What they actually assert                                                                                                       |
   | ----------------------------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------- |
@@ -44,6 +44,8 @@ You should treat `ccb` the way you would treat any other terminal automation too
   | `ccb inspect --lines 0`                                  | Refused with `ccb: --lines must be positive integer, got: "0"` and exit code 2. Same for `--lines -5`, `--lines foo`, `--lines 1.5`. |
 
   These smokes ran against sessions started via ccmux's default (no `--safe-permissions`), which in the tested ccmux version launches `claude` with bypass-permissions behavior, so they never produced a real Claude Code permission popup.
+
+  The P1 **100-trial live gate** has also passed once (2026-07-30, prefix `CCB100J30D`: final release-candidate code, 100/100, no lost/duplicate/extra/reorder/undelivered, zero capture errors), plus a separate clean 3-session isolation run (3×3 live, no leakage). Both are single-host passes on Windows, not continuous integration. See [STRESS.md](./STRESS.md) for artifacts and limits.
 
 ### Test matrix: capability vs. evidence
 
@@ -118,6 +120,27 @@ Guarantees and controls:
 - **Escape hatch:** `--no-wait` restores fire-and-forget — it skips baseline capture and the barrier entirely and exits 0; the output carries `readiness: { waited: false, ready: null, reason: "skipped" }`.
 - **Outcomes:** `reason: "timeout-stale"` means the tail never changed (stale output or a frozen pane); `reason: "timeout-not-ready"` means it changed but never settled to idle (e.g. a slash-opened menu); `reason: "capture-error"` means `ccmux capture` failed mid-poll; `reason: "baseline-capture-failed"` means the pre-delivery baseline could not be acquired.
 - **Telemetry:** every `ccb slash` result carries `commandId`, `injectedAt` (on successful delivery), and (when waited) `readiness.readyAt`, `waitedMs`, `attempts`, `reason`, and `evidence` for audit.
+- **Autocomplete confirmation (Claude Code v2.1.218):** the first `Enter` after pasting a slash command only *accepts the autocomplete suggestion*; the command stays staged in the active input (`> /model default`) and is not submitted. In waited mode `ccb slash` now performs a **bounded, guarded confirmation** between delivery and the readiness barrier: it settles, captures the pane, and sends **one** additional `Enter` **only** when the bottom active input still contains *exactly* the submitted command (ANSI / NBSP / whitespace normalized). It does **not** send a second Enter when the command already executed (idle empty prompt), when the pane is thinking/busy (no input prompt), or when the active input differs (a menu or other staged text). At most one confirmation Enter is ever sent. The outcome is reported as `readiness.confirmation` (`confirmSent`, `reason` of `autocomplete-staged` / `executed` / `thinking` / `different` / `sendEnter-unavailable`, `attempts`). `--no-wait` skips this confirmation conservatively (`reason: "no-wait"`) — it never sends an unobserved Enter.
+
+### Pre-injection idle baseline
+
+A slash command is **mode-changing**. A second live finding (3-session isolation, session C, trial 3) showed that injecting a slash while the pane was still *thinking* — Claude was running stop hooks after the previous `send` had already reached ccmux's terminal `done` — mutated the session *after* the caller had received a failure (the post-injection barrier timed out at `state=thinking`, exit 6, but the queued `/model default` later executed when the pane went idle).
+
+`ccb slash` (waited mode) now gates injection on a **confirmed injectable baseline**, acquired *under the same per-session lock* and *before any transport write*:
+
+1. Acquire the session lock (unchanged coordinator/journal lifecycle).
+2. Poll the **canonical pane classifier** (`classifyPane`, via `readyState`) until the pane is **injectable**, with a bounded timeout. The injectable rule is decided from classifier result fields/evidence, not ad-hoc text matching:
+   - state **`idle`** (empty `>` prompt + footer, no spinner); **or**
+   - state **`done`** *only* when the classifier evidence proves an **empty active prompt + footer AND no spinner/busy signal** (`evidence.footer && evidence.emptyPrompt && !evidence.spinnerActive`).
+
+   A **bare `done` marker is not accepted.** `done` is marker-complete and can overlap stop hooks, so `done` + spinner/busy/queued-message is non-injectable. A **stale `done` marker resting on a clearly idle empty prompt stays usable.** Thinking / `needs_input` / `permission_prompt` / `unknown` / `crashed` — and the "edit queued messages" pane (wording varies by Claude Code version) — **never** qualify.
+3. Only when injectable, paste + Enter, run the autocomplete confirmation, then the existing fresh-idle readiness barrier.
+
+If the pane never becomes injectable within the budget, `ccb slash` returns a **not-injected** result with **no `enterText`**, exit 7, truthful journal (`not-injected`, `safeToRetry: true`) and telemetry: `readiness.phase: "pre-injection"`, `readiness.reason: "baseline-not-idle"` (busy) or `"baseline-capture-failed"` (ccmux capture error), plus `preInjection` (state, reason, waitedMs, attempts, evidence). The lock is released cleanly. This is deliberately distinct from a **post-injection** readiness timeout, which is exit 6 with `readiness.reason: "timeout-not-ready"` / `"timeout-stale"`.
+
+The timeout is configurable: `--idle-timeout-ms` (pre-injection gate) defaults to `--ready-timeout-ms` (post-injection barrier), so a single knob tolerates long stop hooks. The live stress harness passes `config.readyTimeoutMs` to both budgets (single-session and isolation).
+
+**Caveat — `done` is marker-complete, not pane-idle.** ccmux's terminal `send` status `done` (and the pane classifier's `done` state from a `CCMUX_DONE:<uuid>` marker in view) means *the job reached a completion marker*, **not** that Claude's pane is provably idle. Stop hooks can keep the pane busy past the marker. The pre-injection gate therefore does **not** accept a bare `done`: it requires `done` to coincide with classifier-proven idle evidence (empty prompt + footer, no spinner). `send` status `done` is **not** redefined to mean pane-idle.
 
 ### Per-session injection serialization
 
@@ -130,7 +153,7 @@ Guarantees and controls:
 - Release requires both owner token and command ID. A delayed prior owner cannot release a recovered owner's lock.
 - Before transport starts, a proven baseline failure is `not-injected`. After transport may have started, every failure is `uncertain` and is never retried automatically.
 - `send` uses two phases: `ccmux send` runs under the lock and returns a job acknowledgment; `ccmux wait JOB_ID` runs after release. This lets `steer` enter the same session while Claude is still working.
-- After `ccmux send` acknowledges the job, `ccb` allows up to 5000 ms to observe a pane change before calling the injection confirmed. No change yields `ack: "uncertain"` and exit 9; the validated job payload remains in telemetry for inspection, but `ccb` does not enter the terminal wait or retry automatically.
+- After `ccmux send` acknowledges the job, `ccb` allows up to 5000 ms to observe that the injection landed before calling it confirmed. Delivery is recognized when either the pane **tail re-renders** (the bottom fingerprint changes from the pre-injection baseline) **or** the pane **transitions from a quiescent baseline (idle, or a done marker resting on an idle empty prompt) into an active state** (`thinking`, `needs_input`, `permission_prompt`) — the same signal a human reads. The transition is gated on a quiescent baseline, so an already-busy pane can never falsely confirm delivery. The second path exists because a long/wrapped prompt renders its spinner *above* the static footer that anchors the bottom of the pane, so the tail alone can stay byte-identical to the idle baseline — that was the `CCB100J30B` trial-27 false negative (`injection-not-observed` on a prompt that had actually landed). No observable change and no active transition within the budget yields `ack: "uncertain"` and exit 9; the validated job payload remains in telemetry for inspection, but `ccb` does not enter the terminal wait or retry automatically.
 - `slash` keeps the lock through its readiness barrier. `steer` releases after tmux confirms the paste operation returned.
 - This protocol guarantees per-session mutual exclusion and at-most-once automatic injection on one host. It does not guarantee FIFO fairness, distributed locking, or exactly-once delivery after a crash.
 
@@ -145,6 +168,10 @@ The command journal records `queued`, `pre-write`, `injecting`, `acknowledged`, 
 - `ccb commands --json` and `ccb command-status ID --json` report the persisted record.
 
 Operator rule: never delete a live-owner lock merely because it is old. Inspect the PID and target pane first. An `injecting` tombstone means delivery may have happened; inspect Claude before sending the command again.
+
+### Stress & fault harness
+
+The P1 stress/fault harness exercises the lifecycle above at scale and under injected crashes. Its deterministic unit, fault-recovery, and 3-session isolation tests run under `npm test` (no Claude); the live 100-trial slash-then-prompt run is opt-in (`--live --yes`), never part of `npm test`, and has passed once on Windows (2026-07-30, prefix `CCB100J30D`, final release-candidate code). See [STRESS.md](./STRESS.md) for exact commands, prerequisites, artifacts, and limitations.
 
 ### Exit codes
 
@@ -184,7 +211,7 @@ These labels summarize the test matrix above in one line per capability. They ar
 In rough priority order. Each item is a concrete gap, not a wishlist.
 
 1. **Real permission popups, all three platforms.** Start a session with `ccb start --safe-permissions` (which in the tested ccmux version suppresses bypass-permissions behavior and surfaces real prompts), trigger a real Bash or Edit tool permission prompt, capture the actual pane bytes, and add them as a fixture. Repeat on Windows, Linux, and macOS. Until this exists, `permission_prompt` classification is unverified outside synthetic fixtures.
-2. **Crash / recovery tests.** Kill the `claude` process inside a live `tmux` session and verify the classifier produces `crashed` (or a documented `unknown` with the right `evidence`). Kill the `tmux` server and verify the recovery runbook in [OPERATIONS.md](./OPERATIONS.md) actually works.
+2. **Crash / recovery tests.** Bridge-process recovery is already covered deterministically (a real child process writes a journal record in `queued`/`pre-write`, `injecting`, or `acknowledged`/`released` state, then dies; the parent reconciles via the real-PID liveness probe — see `test/fault-recovery.test.mjs`). What is **not** verified live: kill the `claude` process inside a live `tmux` session and confirm the classifier produces `crashed` (or a documented `unknown` with the right `evidence`); kill the `tmux` server and confirm the recovery runbook in [OPERATIONS.md](./OPERATIONS.md) actually works.
 3. **Unnumbered cursor menu, end-to-end.** Synthesize a real CC TUI session that produces an unnumbered arrow-key menu and verify that `approve`/`deny` navigation reaches the correct option. Currently this is only tested at the unit level with synthetic labels.
 4. **Cross-platform smoke.** Run the full `inspect` / `watch` / `steer` smoke suite on Linux and macOS. Several code paths key off `process.platform === "win32"` and have only been exercised on Windows.
 5. **Large-payload steer.** Verify a 10 KB+ multiline payload still arrives intact end-to-end. The temp-file + `paste-buffer -dpr` path should handle it but has not been measured.

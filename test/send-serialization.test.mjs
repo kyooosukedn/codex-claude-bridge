@@ -167,13 +167,25 @@ test("send wait failure stays post-lock and exits uncertain", async () => {
 test("coordinated slash keeps lock through readiness barrier and preserves telemetry", async () => {
   const events = [];
   let nowCall = 0;
+  // A pane the canonical classifier reads as idle (empty `>` + footer). The
+  // pre-injection gate must confirm this before any transport write.
+  const idleBaseline = [
+    "● ready",
+    "",
+    "─────────────────────────────────────────────────────────────────── alpha ──",
+    ">",
+    "────────────────────────────────────────────────────────────────────────────────",
+    "  glm-5.2 │ work",
+    "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+    "",
+  ].join("\n");
   const result = await executeCoordinatedSlash({
     session: "alpha",
     text: "/plan",
     opts: { "ready-timeout-ms": "1234" },
     deps: {
       coordinateInjection: fakeCoordinator(events),
-      capture: () => "idle-before",
+      capture: () => idleBaseline,
       enterText: () => {
         events.push("tmux:enter");
         return { session: "alpha", entered: true, bytes: 5 };
@@ -181,7 +193,7 @@ test("coordinated slash keeps lock through readiness barrier and preserves telem
       modeReadyBarrier: async (session, baseline, timeoutMs, intervalMs) => {
         events.push("slash:barrier");
         assert.equal(session, "alpha");
-        assert.equal(baseline, "idle-before");
+        assert.equal(baseline, idleBaseline);
         assert.equal(timeoutMs, 1234);
         assert.equal(intervalMs, 1000);
         return {
@@ -195,6 +207,7 @@ test("coordinated slash keeps lock through readiness barrier and preserves telem
       },
       now: () =>
         new Date(`2026-07-25T12:00:0${nowCall++}.000Z`),
+      sleep: async () => {},
     },
   });
 
