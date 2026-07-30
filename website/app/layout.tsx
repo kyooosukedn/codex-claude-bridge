@@ -11,12 +11,12 @@ const publicSiteUrl =
 export const metadata: Metadata = {
   title: "Codex Claude Bridge",
   description:
-    "Control persistent Claude Code sessions from Codex. Send work, steer mid-run, inspect state, and keep the conversation alive.",
+    "Use Codex to send, inspect, steer, and answer prompts in persistent Claude Code sessions on your workstation.",
   metadataBase: new URL(publicSiteUrl),
   openGraph: {
     title: "Codex Claude Bridge",
     description:
-      "A local-first control plane for persistent Claude Code sessions.",
+      "Let Codex return to the Claude Code session already running on your workstation.",
     type: "website",
     images: [
       {
@@ -31,7 +31,7 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "Codex Claude Bridge",
     description:
-      "A local-first control plane for persistent Claude Code sessions.",
+      "Let Codex return to the Claude Code session already running on your workstation.",
     images: [`${publicSiteUrl}/og.png`],
   },
 };

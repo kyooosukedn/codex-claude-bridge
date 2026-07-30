@@ -29,12 +29,20 @@ test("server-renders the Codex Claude Bridge landing page", async () => {
 
   const html = await response.text();
   assert.match(html, /<title>Codex Claude Bridge<\/title>/i);
-  assert.match(html, /Drive a persistent Claude Code session from Codex\./);
+  assert.match(html, /Tell Codex to use the Claude Code session on your workstation\./);
   assert.match(html, /https:\/\/github\.com\/kyooosukedn\/codex-claude-bridge/);
   assert.match(html, /ccb send --session worker/);
   assert.match(html, /ccb steer --session worker/);
   assert.match(html, /ccb inspect --session worker --json/);
-  assert.match(html, /npm install -g codex-claude-bridge/);
+  assert.match(html, /ccb approve --session worker/);
+  assert.match(
+    html,
+    /npm install -g github:kyooosukedn\/codex-claude-bridge claude-code-tmux/,
+  );
+  assert.match(html, /ccb doctor/);
+  assert.match(html, /ccb patch-ccmux-windows/);
+  assert.match(html, /ccb send --session demo/);
+  assert.doesNotMatch(html, /npm install -g codex-claude-bridge/);
 });
 
 test("does not ship starter preview artifacts", async () => {
