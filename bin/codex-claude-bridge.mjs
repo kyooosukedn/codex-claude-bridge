@@ -1,12 +1,9 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { spawnSync } from "node:child_process";
 import {
   existsSync,
-  mkdirSync,
   readFileSync,
   realpathSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
@@ -20,6 +17,8 @@ import {
 import { buildSteerPayload, countLines } from "../lib/steer.mjs";
 import { awaitReadyState, paneSignature } from "../lib/readiness.mjs";
 import { coordinateInjection } from "../lib/session-coordinator.mjs";
+import { createTransport } from "../lib/transport.mjs";
+import { createCommandJournal } from "../lib/command-journal.mjs";
 
 const DEFAULT_SESSION = "codex-claude";
 const DEFAULT_TIMEOUT_MS = 180000;
@@ -81,6 +80,8 @@ Usage:
   ccb type [--session NAME] [--enter] "raw message"
   ccb slash [--session NAME] [--ready-timeout-ms MS] [--no-wait] "command"
   ccb steer [--session NAME] "message"
+  ccb commands [--session NAME] [--json]
+  ccb command-status ID [--json]
 
   ccb inspect [--session NAME] [--lines N] [--json]
     Classify the live Claude Code pane state.
@@ -154,14 +155,11 @@ function envWithTmux() {
   return env;
 }
 
+const transport = createTransport({ env: envWithTmux() });
+const commandJournal = createCommandJournal();
+
 function run(command, args = [], options = {}) {
-  return spawnSync(command, args, {
-    cwd: options.cwd,
-    env: envWithTmux(),
-    encoding: "utf8",
-    shell: process.platform === "win32",
-    stdio: options.stdio || "pipe",
-  });
+  return transport.run(command, args, options);
 }
 
 function must(command, args = [], options = {}) {
@@ -178,12 +176,16 @@ function sleep(ms) {
 }
 
 function commandOk(command, args = ["--version"]) {
-  const result = run(command, args);
-  return {
-    ok: result.status === 0,
-    command,
-    output: (result.stdout || result.stderr || "").trim().split(/\r?\n/)[0] || "",
-  };
+  try {
+    const result = run(command, args);
+    return {
+      ok: result.status === 0,
+      command,
+      output: (result.stdout || result.stderr || "").trim().split(/\r?\n/)[0] || "",
+    };
+  } catch (error) {
+    return { ok: false, command, output: error.message };
+  }
 }
 
 function safeName(value) {
@@ -451,6 +453,7 @@ function defaultCommandDeps() {
     steerMessage,
     modeReadyBarrier,
     now: () => new Date(),
+    journal: commandJournal,
   };
 }
 
@@ -479,6 +482,7 @@ export async function executeSend({
     inject: () => parseCcmuxJob(deps.send(session, prompt), session),
     observeInjection: ({ baseline, payload }) =>
       deps.observe({ session, baseline, payload }),
+    journal: deps.journal,
   });
 
   if (coordinated.ack !== "injected") {
@@ -575,6 +579,7 @@ export async function executeCoordinatedSlash({
       observed: true,
       reason: payload.readiness?.reason || "transport-returned",
     }),
+    journal: deps.journal,
   });
   if (coordinated.ack !== "injected") {
     if (coordinated.ack === "not-injected") {
@@ -619,6 +624,34 @@ export async function executeSteer({
     captureBaseline: () => deps.capture(session),
     inject: () => deps.steerMessage(session, message),
     observeInjection: () => ({ observed: true, reason: "transport-returned" }),
+    journal: deps.journal,
+  });
+  return {
+    body: coordinated,
+    exitCode:
+      coordinated.ack === "injected"
+        ? 0
+        : coordinatorFailureExit(coordinated.ack),
+  };
+}
+
+export async function executeType({
+  session,
+  text,
+  enter = false,
+  deps = defaultCommandDeps(),
+}) {
+  const coordinated = await deps.coordinateInjection({
+    session,
+    commandId: randomUUID(),
+    commandClass: "raw-input",
+    pid: process.pid,
+    maxPreWriteAttempts: 1,
+    now: deps.now,
+    captureBaseline: () => deps.capture(session),
+    inject: () => deps.enterText(session, text, enter),
+    observeInjection: () => ({ observed: true, reason: "transport-returned" }),
+    journal: deps.journal,
   });
   return {
     body: coordinated,
@@ -921,21 +954,9 @@ function key(session, keys) {
 
 function enterText(session, text, enter = true) {
   const target = tmuxSessionName(session);
-  const tmpDir = path.join(os.tmpdir(), "codex-claude-bridge");
-  mkdirSync(tmpDir, { recursive: true });
-  const file = path.join(tmpDir, `${randomUUID()}.txt`);
-  writeFileSync(file, text);
-  try {
-    tmux(["load-buffer", msysPathForShell(file)]);
-    tmux(["paste-buffer", "-p", "-t", target]);
-    if (enter) tmux(["send-keys", "-t", target, "Enter"]);
-  } finally {
-    try {
-      unlinkSync(file);
-    } catch {
-      // Best effort cleanup.
-    }
-  }
+  tmux(["load-buffer", "-"], { input: text });
+  tmux(["paste-buffer", "-p", "-t", target]);
+  if (enter) tmux(["send-keys", "-t", target, "Enter"]);
   return { session, tmuxSession: target, entered: enter, bytes: Buffer.byteLength(text) };
 }
 
@@ -945,22 +966,13 @@ function enterText(session, text, enter = true) {
 // interpret as separate Enter presses — truncating the paste to its first line.
 function steerMessage(session, message) {
   const target = tmuxSessionName(session);
-  const tmpDir = path.join(os.tmpdir(), "codex-claude-bridge");
-  mkdirSync(tmpDir, { recursive: true });
-  const file = path.join(tmpDir, `${randomUUID()}.txt`);
   const fullMessage = buildSteerPayload(message);
-  writeFileSync(file, fullMessage);
   const buffer = `ccb-steer-${randomUUID()}`;
   try {
-    tmux(["load-buffer", "-b", buffer, msysPathForShell(file)]);
+    tmux(["load-buffer", "-b", buffer, "-"], { input: fullMessage });
     tmux(["paste-buffer", "-dpr", "-b", buffer, "-t", target]);
     tmux(["send-keys", "-t", target, "Enter"]);
   } finally {
-    try {
-      unlinkSync(file);
-    } catch {
-      // Best effort cleanup.
-    }
     try {
       tmux(["delete-buffer", "-b", buffer]);
     } catch {
@@ -1079,6 +1091,29 @@ function doctor(json = false) {
   }
 }
 
+function printCommandRecords(records, json) {
+  if (json) {
+    process.stdout.write(`${JSON.stringify(records, null, 2)}\n`);
+    return;
+  }
+  if (!records.length) {
+    console.log("No journaled commands.");
+    return;
+  }
+  for (const record of records) {
+    console.log(
+      [
+        record.commandId,
+        record.session,
+        record.commandClass,
+        record.currentState,
+        record.ack || "-",
+        record.updatedAt,
+      ].join("\t"),
+    );
+  }
+}
+
 async function main() {
   const { command, opts } = parse(process.argv.slice(2));
   const session = safeName(opts.session || opts.name || DEFAULT_SESSION);
@@ -1086,6 +1121,29 @@ async function main() {
 
   if (command === "help") return printHelp();
   if (command === "doctor") return doctor(Boolean(opts.json));
+  if (command === "commands") {
+    const requestedSession = opts.session ? session : undefined;
+    await commandJournal.reconcile({ session: requestedSession });
+    const records = await commandJournal.listCommands({
+      session: requestedSession,
+    });
+    printCommandRecords(records, Boolean(opts.json));
+    return;
+  }
+  if (command === "command-status") {
+    const commandId = opts._[0];
+    if (!commandId) throw new Error("command-status requires command ID");
+    await commandJournal.reconcile();
+    const records = await commandJournal.listCommands();
+    const record = records.find((item) => item.commandId === commandId);
+    if (!record) {
+      process.exitCode = 4;
+      throw new Error(`Unknown command ID: ${commandId}`);
+    }
+    if (opts.json) process.stdout.write(`${JSON.stringify(record, null, 2)}\n`);
+    else printCommandRecords([record], false);
+    return;
+  }
   if (command === "patch-ccmux-windows") {
     console.log(JSON.stringify(patchCcmuxWindows(), null, 2));
     return;
@@ -1115,6 +1173,7 @@ async function main() {
       "timeout-ms",
     );
     const settleMs = parsePositiveInt(opts["settle-ms"], 3000, "settle-ms");
+    await commandJournal.reconcile({ session });
     ensureSession({
       session,
       cwd,
@@ -1134,7 +1193,14 @@ async function main() {
   if (command === "type") {
     const text = opts._.join(" ");
     if (!text) throw new Error("type requires text");
-    console.log(JSON.stringify(enterText(session, text, Boolean(opts.enter)), null, 2));
+    await commandJournal.reconcile({ session });
+    const { body, exitCode } = await executeType({
+      session,
+      text,
+      enter: Boolean(opts.enter),
+    });
+    console.log(JSON.stringify(body, null, 2));
+    if (exitCode !== 0) process.exitCode = exitCode;
     return;
   }
   if (command === "slash") {
@@ -1145,6 +1211,7 @@ async function main() {
     // injectedAt, and exit codes) lives in executeSlash so it is unit-testable.
     // main() always prints the telemetry body, then propagates a nonzero exit
     // code so a sequential caller cannot proceed into a known non-ready pane.
+    await commandJournal.reconcile({ session });
     const { body, exitCode } = await executeCoordinatedSlash({ session, text, opts });
     console.log(JSON.stringify(body, null, 2));
     if (exitCode !== 0) process.exitCode = exitCode;
@@ -1153,6 +1220,7 @@ async function main() {
   if (command === "steer") {
     const message = opts._.join(" ").trim();
     if (!message) throw new Error("steer requires message");
+    await commandJournal.reconcile({ session });
     const { body, exitCode } = await executeSteer({ session, message });
     console.log(JSON.stringify(body, null, 2));
     if (exitCode !== 0) process.exitCode = exitCode;

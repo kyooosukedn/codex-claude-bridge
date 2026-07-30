@@ -49,9 +49,9 @@ sequenceDiagram
 
 There are five layers:
 
-1. **Codex / outer agent** invokes `ccb` as a normal subprocess. Every `ccb` invocation is short-lived and stateless from the caller's perspective.
-2. **`ccb` CLI** is a dependency-free Node ESM package with one entry point (`bin/codex-claude-bridge.mjs`) and two pure helper modules (`lib/pane.mjs` for ANSI stripping and pane classification, `lib/steer.mjs` for the multiline steer payload builder). The entry script builds argv for `ccmux` or `tmux`, parses their output, and prints structured JSON or concise human output.
-3. **`ccmux`** is the session manager from `claude-code-tmux`. It owns the mapping from a logical session name to a `tmux` session, plus job tracking and a completion protocol. `ccb` shells out to `ccmux` for `start`, `send`, `capture`, `status`, `jobs`, `attach`, `kill`, and `steer` (legacy path).
+1. **Codex / outer agent** invokes `ccb` as a normal subprocess. Every invocation is short-lived; durable command state lives on disk.
+2. **`ccb` CLI** is a dependency-free Node ESM package. `lib/transport.mjs` resolves real executables, `lib/session-coordinator.mjs` serializes injections, and `lib/command-journal.mjs` records their lifecycle. Pane classification and multiline payload handling remain isolated in `lib/pane.mjs` and `lib/steer.mjs`.
+3. **`ccmux`** is the session manager from `claude-code-tmux`. It owns the mapping from a logical session name to a `tmux` session, plus job tracking and a completion protocol. `ccb` invokes it directly for `start`, `send`, `capture`, `status`, `jobs`, `attach`, and `kill`.
 4. **`tmux`** is the terminal multiplexer hosting the actual `claude` process. `ccb` talks to it directly for low-level keystrokes (`key`, `choose`, `enter`, `escape`, `interrupt`), for typed text via `paste-buffer` (`type`, `slash`), and for the multiline-safe `steer` path.
 5. **`claude` CLI** is the real interactive Claude Code TUI. It reads from and writes to the pseudo-terminal attached by `tmux`, exactly as it would for a human.
 
@@ -63,7 +63,7 @@ flowchart LR
         CODEX[Codex / shell / script]
     end
 
-    subgraph Bridge["ccb (stateless per invocation)"]
+    subgraph Bridge["ccb (short-lived process + durable local state)"]
         BIN[bin/codex-claude-bridge.mjs]
         PANElIB[lib/pane.mjs<br/>stripAnsi · classifyPane · selectOption]
         STEERLIB[lib/steer.mjs<br/>buildSteerPayload · countLines]
@@ -86,7 +86,7 @@ flowchart LR
     CLAUDE -- reads/writes --> REPO
 ```
 
-The bridge itself owns no long-running state. Persistence lives in three places: the `tmux` server (the live process and PTY context for each session), `ccmux`'s state registry at `~/.pi/ccmux/state.json` (or `$CCMUX_HOME` if set; session names, job records, log paths), and per-job completion markers under `<session-cwd>/.ccmux/jobs/`. Claude Code may persist its own transcripts separately; the bridge has no integration with any Claude resume or recovery mechanism.
+The bridge owns no daemon, but it does own durable local state. Persistence lives in the `tmux` server, the `ccmux` registry, ccmux job markers, per-session injection locks under `~/.codex-claude-bridge/locks`, and redacted command records under `~/.codex-claude-bridge/journal`. Claude Code may persist transcripts separately; the bridge has no Claude resume integration.
 
 ## Session naming and persistence
 
@@ -97,7 +97,7 @@ A logical `--session NAME` is the only handle the caller needs. `ccb` resolves i
 
 **Persistence boundaries**:
 
-- `ccb` invocations are stateless. Two `ccb` calls in the same Codex chat do not share memory; they share state only through the underlying `tmux` session.
+- `ccb` invocations do not share memory. They coordinate through lock files, the command journal, and the underlying `tmux` session.
 - If the `tmux` server dies, all `claude` sessions inside it die. `ccb` cannot resurrect the conversation; recovery means starting a new session and accepting that the in-context conversation is lost. `claude --resume` is outside the bridge's scope.
 - If `claude` crashes inside a live `tmux` session, the `tmux` window remains open and the shell prompt reappears. `inspect` may classify this as `crashed` or `unknown` depending on what is on screen.
 
@@ -105,14 +105,28 @@ A logical `--session NAME` is the only handle the caller needs. `ccb` resolves i
 
 | Command  | What it does                                                                                                                                                                                                                                                                                                                                                              | Use when                                                                                                                              |
 | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `send`   | Wraps `ccmux send --wait`. Sends a prompt, waits for the ccmux completion marker, returns ccmux's job JSON. Uses the ccmux completion protocol so the caller knows when the turn finished.                                                                                                                                                                                | Codex wants a request/response cycle with a clear "done" signal.                                                                      |
+| `send`   | Calls `ccmux send`, records the observed injection, releases the session lock, then calls `ccmux wait JOB_ID`. This leaves the session available for `steer` while Claude works. | Codex wants a request/response cycle with a clear terminal result. |
 | `type`   | Loads arbitrary text into a tmux buffer and pastes it (no `-r`; tmux converts LF to CR). Presses Enter unless `--enter` is omitted.                                                                                                                                                                                                                                       | Inject a single-line message as if typed. Use for `/slash` commands or messages without newlines.                                     |
 | `slash`  | Same as `type` but prepends `/` if missing and always presses Enter.                                                                                                                                                                                                                                                                                                     | Invoke a Claude Code slash command (`/cost`, `/release-notes`, etc.).                                                                 |
-| `steer`  | Multiline-safe: writes the message to a temp file, loads it into a named tmux buffer, and pastes with `paste-buffer -dpr` (bracket paste + LF preservation). Sends Enter. Prefixed with `Steering update from ccmux:` so the live session can recognize injected steering.                                                                                              | Inject a long, potentially multiline message mid-turn. The only path that reliably preserves newlines end-to-end.                     |
+| `steer`  | Multiline-safe: streams the message into a named tmux buffer over stdin and pastes with `paste-buffer -dpr` (bracket paste + LF preservation). Sends Enter. Prefixed with `Steering update from ccmux:` so the live session can recognize injected steering. | Inject a long, potentially multiline message mid-turn. |
 | `key`    | Sends raw tmux key names (`Up`, `Down`, `Enter`, `C-c`, `Tab`, etc.) via `tmux send-keys`.                                                                                                                                                                                                                                                                                | Escape hatch for any keystroke not covered by a higher-level command.                                                                 |
 | `choose` | Sends `<number>` + `Enter`.                                                                                                                                                                                                                                                                                                                                               | Pick a numbered menu option by position. Use when `approve`/`deny` refuse or when you already know the option number from `inspect`. |
 
 `send` is the only command that blocks until ccmux reports a job complete. Everything else is fire-and-forget; the caller is expected to follow up with `inspect` or `watch`.
+
+## Transport V2
+
+All child processes in the interactive bridge runner are launched with `shell: false`. On POSIX, commands are invoked directly. On Windows, `tmux` resolves to the real `tmux.exe`; npm-installed tools resolve through package metadata instead of `.cmd` shims. Node-based bins run as `node <entry> ...args`, while Claude's native package bin runs directly. The separate experimental native-channel preflight still has its own fixed-argument launcher.
+
+`send` passes its prompt as one argv item to the Node-based ccmux entry. `type`, `slash`, and `steer` stream text to `tmux load-buffer -` over stdin. Shell metacharacters such as `&`, `|`, `;`, `$()`, and quotes remain data.
+
+## Durable command journal
+
+Each `send`, `type`, `slash`, or `steer` command gets a command ID. The coordinator writes atomic JSON records under `~/.codex-claude-bridge/journal/<session>/<command-id>.json`. Records contain command class, lifecycle transitions, attempt number, timestamps, PID, acknowledgement, retry verdict, and failure reason. Prompt text and transport payloads are excluded by schema.
+
+Writes use a private directory, a temporary `0600` file where supported, fsync, and atomic rename. A journal write failure before transport blocks injection. A failure after transport starts returns `uncertain`.
+
+On a later invocation, reconciliation only touches records whose owner PID is definitely dead. `queued` and `pre-write` become safely `not-injected`; `injecting` becomes `uncertain` and is never retried automatically; `acknowledged` remains delivered. A live or unknown PID is left alone. The session lock for a dead `injecting` owner remains fenced because its child transport may still be alive.
 
 ## Multiline steer implementation
 
@@ -125,14 +139,14 @@ A logical `--session NAME` is the only handle the caller needs. `ccb` resolves i
 `steerMessage(session, message)` does this instead:
 
 1. Builds the payload with the pure `buildSteerPayload(message)` helper (`Steering update from ccmux:\n` + trimmed message).
-2. Writes it verbatim to a per-invocation temp file under `os.tmpdir()/codex-claude-bridge/`.
-3. Loads the file into a named tmux buffer with `tmux load-buffer -b <buffer> <msys-path>`.
+2. Streams it to a named tmux buffer with `tmux load-buffer -b <buffer> -`.
+3. Keeps the payload out of temporary files and command argv.
 4. Pastes with `tmux paste-buffer -dpr -b <buffer> -t <session>`:
    - `-d` deletes the buffer after paste,
    - `-p` wraps the paste in bracketed-paste markers so Claude Code's TUI treats it as a paste rather than typed input,
    - `-r` disables tmux's LF→CR conversion so embedded newlines survive into the TUI verbatim.
 5. Sends a single `Enter` to submit the pasted block.
-6. Cleans up the temp file and best-effort deletes the tmux buffer in a `finally` block.
+6. Best-effort deletes the tmux buffer in a `finally` block.
 
 The payload is built by a pure function in `lib/steer.mjs` so unit tests can verify newline preservation without invoking tmux.
 
@@ -196,7 +210,7 @@ Every classification result includes `evidence`: a small object with the fields 
 5. **Windows paste visibility.** After `tmux paste-buffer -p -r`, inserts a `process.platform === "win32"` break in the paste-visibility retry loop so ccmux does not wait for the prompt text to become visible in the pane (which is unreliable on Windows).
 6. **PowerShell Claude launch.** Rewrites the command-composition step to prepend `Set-Location -LiteralPath <cwd>` on Windows so `--cwd` is honored, and strips conflicting `ANTHROPIC_*` environment variables from the spawn environment before invoking `claude`.
 
-Important: the bridge's own `ccb steer` command does **not** use ccmux's `steerSession`. It talks to `tmux` directly via a per-invocation temp file and `tmux load-buffer` / `paste-buffer -dpr`. Item 4 patches a legacy ccmux code path that the bridge no longer exercises end-to-end. The regression test still verifies that the search/replace patterns continue to match upstream source (so the patcher does not silently break on a future ccmux release), but a missing patch does **not** truncate `ccb steer` output.
+Important: the bridge's own `ccb steer` command does **not** use ccmux's `steerSession`. It talks to `tmux` directly via stdin `load-buffer` and `paste-buffer -dpr`. Item 4 patches a legacy ccmux code path that the bridge no longer exercises end-to-end. The regression test still verifies that the search/replace patterns continue to match upstream source, but a missing patch does **not** truncate `ccb steer` output.
 
 The patcher is idempotent: running it twice does not duplicate edits, and the regression test `regression: Windows steer load-buffer patch present in bridge source` verifies that the search/replace patterns still match the upstream source.
 

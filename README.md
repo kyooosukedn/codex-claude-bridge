@@ -6,7 +6,7 @@ It wraps [`claude-code-tmux`](https://www.npmjs.com/package/claude-code-tmux), w
 
 ## How it works
 
-`ccb` is a stateless Node CLI. Every invocation shells out to `ccmux` (for session management, sends, and captures) or `tmux` directly (for raw keystrokes, typed text via `paste-buffer`, and multiline-safe steering). It never speaks to the Anthropic API. Authentication, subscription or usage billing, model selection, and safety policy remain entirely controlled by Claude Code and your Anthropic account configuration.
+`ccb` is a short-lived Node CLI. Its interactive transport starts `ccmux` or `tmux` with an explicit argv vector and `shell: false`; prompt text never becomes shell syntax. A local command journal preserves injection state across invocations without storing prompt text. `ccb` never speaks to the Anthropic API. Authentication, billing, model selection, and policy remain controlled by Claude Code and your Anthropic account.
 
 The classifier reads `ccmux capture` output, strips ANSI, and matches conservative signals for `idle`, `thinking`, `needs_input`, `permission_prompt`, `done`, `crashed`, or `unknown`. When evidence is weak, it returns `unknown` rather than guessing.
 
@@ -87,6 +87,8 @@ ccb send [--session NAME] [--cwd DIR] [--timeout-ms MS] [--startup-wait-ms MS] "
 ccb type [--session NAME] [--enter] "raw message"
 ccb slash [--session NAME] "command"
 ccb steer [--session NAME] "message"
+ccb commands [--session NAME] [--json]
+ccb command-status ID [--json]
 ccb inspect [--session NAME] [--lines N] [--json]
 ccb approve [--session NAME] [--lines N] [--json]
 ccb deny   [--session NAME] [--lines N] [--json]
@@ -123,6 +125,8 @@ npm run check    # tests + --help + doctor smoke
 
 Pure parsing and classification logic lives in `lib/pane.mjs`. Multiline steer helpers live in `lib/steer.mjs`. Tests use canned pane fixtures in `test/`.
 
+Transport resolution lives in `lib/transport.mjs`. Durable command records live under `~/.codex-claude-bridge/journal` by default; set `CCB_HOME` to move bridge state.
+
 ## Notes
 
 This is terminal automation, not an official Claude API. It depends on `ccmux`, `tmux`, and the interactive Claude Code CLI's behavior.
@@ -135,4 +139,4 @@ On Windows, `patch-ccmux-windows` rewrites MSYS2/PowerShell path-quoting issues 
 - `send-job` `load-buffer` path quoting
 - `steer` `load-buffer` path quoting (added 2026-07-23)
 
-`ccb steer` writes the message to a temp file, loads it into a tmux buffer, and pastes with `-dpr` (delete + bracket paste + preserve newlines) so multiline messages survive end-to-end.
+`ccb steer` streams the message to `tmux load-buffer` over stdin, then pastes with `-dpr` (delete + bracket paste + preserve newlines) so multiline messages survive end-to-end.

@@ -2,7 +2,7 @@
 
 An honest accounting of what `ccb` does well, what it does poorly, and what would need to change before it should be called production-grade. No marketing claims.
 
-## Current maturity (2026-07-25)
+## Current maturity (2026-07-30)
 
 **Assessment: early. Usable for careful, supervised automation. Not yet production-grade.**
 
@@ -12,7 +12,7 @@ You should treat `ccb` the way you would treat any other terminal automation too
 
 ### What was verified, by whom, when
 
-- **Automated tests**: 101 main tests and 40 native-channel tests passed on Windows on 2026-07-25. This is a dated snapshot, not a live guarantee; the canonical result is whatever `npm run check` reports on your machine.
+- **Automated tests**: 119 main tests passed on Windows on 2026-07-30. The native-channel suite remains a separate 40-test gate. This is a dated snapshot; `npm run check` is canonical.
 
   | Area                                | Tests | What they actually assert                                                                                                       |
   | ----------------------------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------- |
@@ -77,7 +77,7 @@ These are not theoretical. Each one corresponds to a code path that exists today
 5. **Package upgrades overwrite the ccmux patch.** Every reinstall or upgrade of `claude-code-tmux` replaces the patched `core.mjs`. You must re-run `ccb patch-ccmux-windows` afterwards. `doctor` does not currently warn when the patch is missing.
 6. **Auth, model, and policy remain Claude-owned.** `ccb` never speaks to the Anthropic API and never modifies Claude Code's authentication, subscription billing, model selection, or policy decisions. If your Anthropic account hits a spending cap, or Claude Code refuses a request for safety reasons, the bridge has no way to override it and no way to surface the underlying error except by classifying the resulting pane state.
 7. **Single-shell invocations.** Each `ccb` call spawns one Node process plus at least one `ccmux` or `tmux` subprocess. There is no long-lived daemon and no streaming output. High-frequency `watch` polling has to budget for that overhead.
-8. **Windows shell quoting.** On Windows, the bridge invokes subprocesses with `shell: true` so that `ccmux` and `tmux` resolve through PowerShell. This is necessary for MSYS2 path translation but means user-supplied strings are passed through one extra layer of shell interpretation. The multiline `steer` path avoids this by writing to a file; `type`, `slash`, and `send` still pass text directly through the shell.
+8. **Windows command resolution is installation-layout dependent.** Transport V2 uses `shell: false`. It resolves `tmux.exe` from `PATH` and npm tools from `<npm-bin>/node_modules/<package>/package.json`. Nonstandard installations must expose those directories on `PATH`; the bridge fails closed when it cannot resolve a real executable.
 9. **Serialization is local-host only and not FIFO.** `send`, `slash`, and `steer` share one crash-safe lock per session on this machine. Separate hosts that can reach the same tmux session are outside the protocol. Contenders race for the next fresh `O_EXCL` acquisition; arrival order is not guaranteed.
 10. **A live stuck owner fails closed.** Locks are never stolen by age. If the recorded PID is alive but wedged, new injections return busy until the process exits or an operator verifies the state and repairs the lock manually. PID reuse also fails closed: a reused live PID can delay recovery, but cannot cause an automatic unsafe steal.
 
@@ -96,7 +96,7 @@ The bridge prefers to refuse over guessing. Concrete failure modes:
 | `watch` receives Ctrl+C / SIGTERM                                       | Emits a `stopped` event and exits 0.                                                                                                                                                                          |
 | Numeric flag is zero, negative, non-integer, or NaN                     | Prints `ccb: --<name> must be a positive integer, got: ...` to stderr and exits 2.                                                                                                                            |
 | `ccmux` or `tmux` returns nonzero                                       | The bridge throws with the subprocess's stderr; `main` catches and exits 1.                                                                                                                                   |
-| Session injection lock has a live or unknown owner                     | Refuses injection with `ack: "busy"` and exits 8. No terminal input is sent.                                                                                                                                  |
+| Session injection lock has a live, unknown, or dead `injecting` owner  | Refuses injection with `ack: "busy"` and exits 8. A dead bridge can leave a child transport alive, so `injecting` is never auto-reclaimed.                                                                     |
 | Baseline or phase setup fails before transport                         | Returns `ack: "not-injected"` and exits 7. Nothing was delivered, so retry is safe after fixing the cause.                                                                                                    |
 | Transport may have started but acknowledgment is missing or malformed  | Returns `ack: "uncertain"` and exits 9. Never retries automatically. Inspect the pane before deciding whether to resend.                                                                                      |
 | `ccmux wait` fails or returns invalid JSON after an accepted `send`     | Keeps the successful coordinator acknowledgment, reports terminal `status: "unknown"`, and exits 9. The injection is not retried.                                                                            |
@@ -121,10 +121,11 @@ Guarantees and controls:
 
 ### Per-session injection serialization
 
-`send`, `slash`, and `steer` serialize only their terminal-injection critical section. They do not lock the full Claude task.
+`send`, `type`, `slash`, and `steer` serialize only their terminal-injection critical section. They do not lock the full Claude task.
 
 - Lock ownership starts with atomic filesystem create (`O_EXCL`) under `~/.codex-claude-bridge/locks`, keyed by session name.
-- A contender may recover an owner only when the recorded PID is definitely dead (`ESRCH`). Timestamps, TTLs, and heartbeats never authorize a steal.
+- A contender may recover a `pre-write` or `acknowledged` owner only when the recorded PID is definitely dead (`ESRCH`). Timestamps, TTLs, and heartbeats never authorize a steal.
+- A dead owner in `injecting` remains fenced. The bridge process may be gone while its ccmux/tmux child is still running, so automatic reclaim could overlap terminal writes.
 - Dead-owner recovery claims the exact lock generation with an atomic hard link, verifies the tombstone, removes the dead canonical record, then competes for a fresh `O_EXCL` acquisition.
 - Release requires both owner token and command ID. A delayed prior owner cannot release a recovered owner's lock.
 - Before transport starts, a proven baseline failure is `not-injected`. After transport may have started, every failure is `uncertain` and is never retried automatically.
@@ -132,6 +133,16 @@ Guarantees and controls:
 - After `ccmux send` acknowledges the job, `ccb` allows up to 5000 ms to observe a pane change before calling the injection confirmed. No change yields `ack: "uncertain"` and exit 9; the validated job payload remains in telemetry for inspection, but `ccb` does not enter the terminal wait or retry automatically.
 - `slash` keeps the lock through its readiness barrier. `steer` releases after tmux confirms the paste operation returned.
 - This protocol guarantees per-session mutual exclusion and at-most-once automatic injection on one host. It does not guarantee FIFO fairness, distributed locking, or exactly-once delivery after a crash.
+
+### Durable lifecycle recovery
+
+The command journal records `queued`, `pre-write`, `injecting`, `acknowledged`, and `released` transitions as atomic per-command JSON files. It stores metadata only, never prompt text.
+
+- Journal failure before transport stops the command with `not-injected`.
+- Journal failure after transport starts returns `uncertain`.
+- Restart reconciliation requires a definitely dead owner PID. Live and unknown owners are left untouched.
+- A recovered `injecting` command is `uncertain` with `safeToRetry: false`. The bridge never resends it automatically.
+- `ccb commands --json` and `ccb command-status ID --json` report the persisted record.
 
 Operator rule: never delete a live-owner lock merely because it is old. Inspect the PID and target pane first. An `injecting` tombstone means delivery may have happened; inspect Claude before sending the command again.
 

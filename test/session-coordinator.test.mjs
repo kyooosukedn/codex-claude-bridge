@@ -65,6 +65,20 @@ class FakeStore {
   }
 }
 
+class FakeJournal {
+  constructor({ failAt } = {}) {
+    this.failAt = failAt;
+    this.transitions = [];
+  }
+
+  async recordTransition(transition) {
+    this.transitions.push(structuredClone(transition));
+    if (transition.state === this.failAt) {
+      throw new Error(`journal failed at ${transition.state}`);
+    }
+  }
+}
+
 function uuidSequence(prefix = "token") {
   let value = 0;
   return () => `${prefix}-${++value}`;
@@ -188,6 +202,34 @@ test("concurrent dead-owner recovery creates exactly one new owner", async () =>
   assert.equal(winners[0].priorPhase, "pre-write");
   const canonical = await store.read(winners[0].lockPath);
   assert.equal(canonical.ownerToken, winners[0].ownerToken);
+});
+
+test("dead injecting owner remains fenced because transport may be orphaned", async () => {
+  const store = new FakeStore();
+  const dead = await acquireSessionLock(
+    lockArgs({ store, randomUUID: () => "dead-owner" }),
+  );
+  await store.updateIfOwner(
+    dead.lockPath,
+    dead.ownerToken,
+    dead.commandId,
+    { phase: "injecting" },
+  );
+
+  const contender = await acquireSessionLock(
+    lockArgs({
+      store,
+      commandId: "command-2",
+      pid: 202,
+      randomUUID: () => "new-owner",
+      isProcessAlive: async () => false,
+    }),
+  );
+
+  assert.equal(contender.acquired, false);
+  assert.equal(contender.reason, "uncertain-dead-owner");
+  assert.equal(contender.priorPhase, "injecting");
+  assert.equal((await store.read(dead.lockPath)).ownerToken, "dead-owner");
 });
 
 test("a delayed old token cannot release a recovered owner", async () => {
@@ -325,4 +367,75 @@ test("send lock ends before terminal wait so steer can acquire", async () => {
 
   terminal = true;
   assert.equal(terminal, true);
+});
+
+test("coordinator journals the durable injection lifecycle without payload data", async () => {
+  const journal = new FakeJournal();
+  const result = await coordinateInjection({
+    ...lockArgs({ store: new FakeStore() }),
+    journal,
+    captureBaseline: async () => ({ signature: "idle" }),
+    inject: async () => ({ status: "sent", secret: "payload-is-not-journalled" }),
+    observeInjection: async () => ({ observed: true, reason: "pane-changed" }),
+  });
+
+  assert.equal(result.ack, "injected");
+  assert.deepEqual(
+    journal.transitions.map((transition) => transition.state),
+    ["queued", "pre-write", "injecting", "acknowledged", "released"],
+  );
+  assert.doesNotMatch(JSON.stringify(journal.transitions), /payload-is-not-journalled/);
+});
+
+test("journal failure before transport prevents injection", async () => {
+  const journal = new FakeJournal({ failAt: "injecting" });
+  let injectionCalls = 0;
+  const result = await coordinateInjection({
+    ...lockArgs({ store: new FakeStore() }),
+    journal,
+    captureBaseline: async () => ({ signature: "idle" }),
+    inject: async () => {
+      injectionCalls += 1;
+    },
+  });
+
+  assert.equal(injectionCalls, 0);
+  assert.equal(result.ack, "not-injected");
+  assert.equal(result.reason, "journal-error");
+});
+
+test("journal failure after transport starts is uncertain and never retried", async () => {
+  const journal = new FakeJournal({ failAt: "acknowledged" });
+  let injectionCalls = 0;
+  const result = await coordinateInjection({
+    ...lockArgs({ store: new FakeStore() }),
+    journal,
+    maxPreWriteAttempts: 3,
+    captureBaseline: async () => ({ signature: "idle" }),
+    inject: async () => {
+      injectionCalls += 1;
+      return { status: "sent" };
+    },
+    observeInjection: async () => ({ observed: true, reason: "pane-changed" }),
+  });
+
+  assert.equal(injectionCalls, 1);
+  assert.equal(result.attempts, 1);
+  assert.equal(result.ack, "uncertain");
+  assert.equal(result.reason, "journal-error");
+});
+
+test("failure to persist final release remains uncertain", async () => {
+  const journal = new FakeJournal({ failAt: "released" });
+  const result = await coordinateInjection({
+    ...lockArgs({ store: new FakeStore() }),
+    journal,
+    captureBaseline: async () => ({ signature: "idle" }),
+    inject: async () => ({ status: "sent" }),
+    observeInjection: async () => ({ observed: true, reason: "pane-changed" }),
+  });
+
+  assert.equal(result.ack, "uncertain");
+  assert.equal(result.reason, "journal-error");
+  assert.deepEqual(result.states.slice(-2), ["acknowledged", "released"]);
 });
