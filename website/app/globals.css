@@ -450,7 +450,7 @@ h1 {
 .problem-copy p,
 .mechanics-heading > p:last-child,
 .reliability-intro > p,
-.install-section > div > p:last-child {
+.install-copy > p:last-child {
   max-width: 680px;
   color: var(--muted);
   font-size: 1.06rem;
@@ -633,8 +633,8 @@ h1 {
 .install-section {
   display: grid;
   grid-template-columns: 1fr minmax(420px, 0.85fr);
-  gap: 8vw;
-  align-items: center;
+  gap: 28px 8vw;
+  align-items: start;
   padding: 110px 4vw;
   color: white;
   background: var(--cobalt);
@@ -644,8 +644,25 @@ h1 {
   color: white;
 }
 
-.install-section > div > p:last-child {
+.install-copy > p:last-child {
   color: #dbe3ff;
+}
+
+.install-steps {
+  display: grid;
+  gap: 20px;
+}
+
+.install-step {
+  display: grid;
+  gap: 8px;
+}
+
+.install-step > span {
+  color: var(--mint);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 600;
 }
 
 .install-command {
@@ -696,7 +713,7 @@ h1 {
   display: flex;
   flex-wrap: wrap;
   gap: 18px 28px;
-  margin: -36px 0 0;
+  margin: 0;
   padding: 0;
   list-style: none;
   color: #dbe3ff;
