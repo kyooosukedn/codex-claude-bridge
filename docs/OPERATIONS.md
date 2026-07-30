@@ -12,7 +12,7 @@ Every command below is read-only unless it is explicitly marked as mutating. The
 
 - The `claude` CLI, logged in to the account you want to drive.
 - [`claude-code-tmux`](https://www.npmjs.com/package/claude-code-tmux) (`ccmux`). It owns the session registry and the completion protocol.
-- `tmux`. On Windows the supported layout is MSYS2 `tmux` at `C:\msys64\usr\bin\` (the bridge hard-keys Windows shell dispatch off that toolchain).
+- `tmux`. On Windows, put the real MSYS2 `tmux.exe` on `PATH`; `C:\msys64\usr\bin\tmux.exe` is the tested layout.
 - Node 22 or newer (the bridge uses the built-in `node:test` runner and modern ESM).
 
 ### Install the bridge
@@ -31,7 +31,7 @@ ccb doctor
 ccb doctor --json
 ```
 
-`doctor` verifies that every external command the bridge shells out to is reachable on `PATH`. It checks: `node`, `npm`, `pi`, `claude`, `ccmux`, `tmux`, and the current platform string. Each line is either `ok <name>: <output>` or `bad <name>: <error>`. The `--json` form emits the same checks as a single JSON object for orchestration.
+`doctor` verifies that every external command can be resolved without a shell. It checks `node`, `npm`, `pi`, `claude`, `ccmux`, `tmux`, and the current platform. The `--json` form emits the same checks as one object.
 
 `doctor` does **not** verify that the Windows `ccmux` patch is present (see [known limitations](./RELIABILITY.md#known-limitations)). After installing or upgrading `ccmux`, always run `ccb patch-ccmux-windows` next.
 
@@ -58,7 +58,7 @@ Every reinstall or upgrade of `claude-code-tmux` overwrites the patched `core.mj
 
 ## Sessions across multiple Codex chats
 
-A `--session NAME` is the only handle you need. Two `ccb` invocations with the same `--session` name talk to the same underlying `tmux` session, regardless of which Codex chat, terminal, or script issued them. There is no in-process state; the bridge looks up the live session through `ccmux` on every call.
+A `--session NAME` is the only live-session handle you need. Two invocations with the same name talk to the same `tmux` session. They also share local lock and journal state, so separate Codex chats cannot inject into that session at the same time.
 
 ### Naming
 
@@ -90,7 +90,7 @@ If the `tmux` server is still running, this reattaches through `ccmux` and the i
 
 ### What does NOT survive
 
-- The `ccb` process itself owns no state. Killing `ccb` mid-command does not affect the underlying session.
+- The `ccb` process owns no long-running memory. Killing it does not kill Claude, but the journal preserves whether delivery was definitely absent, observed, or uncertain.
 - The `tmux` server dying kills every session inside it. `ccb` cannot resurrect the prior Claude conversation; `claude --resume` is outside the bridge's scope and `ccmux` does not record enough to reattach.
 - `claude` crashing inside a live `tmux` window leaves the shell prompt visible. The window itself stays open until you `ccb kill` it or reissue a start.
 
@@ -137,6 +137,23 @@ The loop below is what `ccb` is shaped for. It is a request/response cycle with 
 | Answer a prompt by raw position                                | `ccb choose N` (escape hatch, no classification)                                   |
 | Send a raw keystroke not covered above                         | `ccb key Up`, `ccb key C-c`, etc.                                                  |
 | Read the raw pane including ANSI                               | `ccb capture`                                                                      |
+| List durable command outcomes                                  | `ccb commands --session NAME --json`                                               |
+| Inspect one command by ID                                      | `ccb command-status ID --json`                                                     |
+
+### Inspecting interrupted commands
+
+```bash
+ccb commands --session auth-fix --json
+ccb command-status COMMAND_ID --json
+```
+
+Reconciliation runs before prompt-bearing commands and these read commands. A dead owner in `queued` or `pre-write` becomes `not-injected`. A dead owner in `injecting` becomes `uncertain`; inspect the Claude pane before deciding whether to send anything again. Never treat `safeToRetry: false` as permission to resend.
+
+### Migration notes for Transport V2
+
+`ccb type` now uses the same lock, baseline capture, journal, and acknowledgement envelope as `send`, `slash`, and `steer`. Scripts that expected the old direct `{session, tmuxSession, entered, bytes}` response must read those fields from `payload` and use top-level `ack` as the delivery result. A failed baseline capture now stops `type` before terminal input and exits 7.
+
+Windows command resolution no longer falls through `.cmd` shims or `shell: true`. Keep the npm global bin directory and the real MSYS2 `tmux.exe` directory on `PATH`. A nonstandard install that cannot be resolved fails closed.
 
 ## Recovery runbook
 
@@ -395,7 +412,7 @@ ccb send --session auth-fix --cwd C:\repo\app "Fix the failing auth tests. Do no
 
 ### Steer with a multiline message
 
-On every platform, `ccb steer` writes the message to a temp file and pastes it via `tmux paste-buffer -dpr`, so embedded newlines survive. You still need shell-level quoting to get the newlines into argv.
+On every platform, `ccb steer` streams the message to a tmux buffer over stdin and pastes it via `tmux paste-buffer -dpr`, so embedded newlines survive. You still need shell-level quoting to get the newlines into `ccb`.
 
 ```bash
 # POSIX — real newlines inside single quotes

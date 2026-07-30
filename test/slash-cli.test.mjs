@@ -17,6 +17,7 @@ import {
   readFileSync,
   existsSync,
   chmodSync,
+  mkdirSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -41,6 +42,16 @@ function makeCcmuxStub({ captureFails = true } = {}) {
       `process.exit(0);\n`,
   );
   if (IS_WIN) {
+    const packageRoot = join(dir, "node_modules", "claude-code-tmux");
+    mkdirSync(packageRoot, { recursive: true });
+    writeFileSync(
+      join(packageRoot, "package.json"),
+      JSON.stringify({ bin: { ccmux: "ccmux-stub.mjs" } }),
+    );
+    writeFileSync(
+      join(packageRoot, "ccmux-stub.mjs"),
+      readFileSync(stubScript, "utf8"),
+    );
     writeFileSync(
       join(dir, "ccmux.cmd"),
       "@echo off\r\nnode \"%~dp0ccmux-stub.mjs\" %*\r\n",
@@ -57,6 +68,7 @@ function makeCcmuxStub({ captureFails = true } = {}) {
   const origPath = process.env[pathVar] || process.env.PATH || "";
   const env = {
     CCB_STUB_LOG: logPath,
+    CCB_HOME: join(dir, "ccb-home"),
     [pathVar]: `${dir}${IS_WIN ? ";" : ":"}${origPath}`,
     PATH: `${dir}${IS_WIN ? ";" : ":"}${origPath}`,
   };
