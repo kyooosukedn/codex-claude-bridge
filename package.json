@@ -8,8 +8,10 @@
     "ccb": "./bin/codex-claude-bridge.mjs"
   },
   "scripts": {
-    "test": "node --test test/pane.test.mjs test/readiness.test.mjs test/slash-handler.test.mjs test/slash-cli.test.mjs test/installed-bin.test.mjs test/session-coordinator.test.mjs test/session-coordinator-fs.test.mjs test/send-serialization.test.mjs test/transport.test.mjs test/command-journal.test.mjs test/commands-cli.test.mjs",
+    "test": "node --test test/pane.test.mjs test/readiness.test.mjs test/slash-handler.test.mjs test/slash-cli.test.mjs test/installed-bin.test.mjs test/session-coordinator.test.mjs test/session-coordinator-fs.test.mjs test/send-serialization.test.mjs test/transport.test.mjs test/command-journal.test.mjs test/commands-cli.test.mjs test/stress-harness.test.mjs test/stress-report.test.mjs test/stress-reviewer.test.mjs test/stress-live-blockers.test.mjs test/fault-recovery.test.mjs test/stress-cli.test.mjs test/slash-confirm.test.mjs test/slash-idle-baseline.test.mjs test/token-observer.test.mjs test/stress-streaming.test.mjs test/pane-joined-separator.test.mjs test/pane-injection-observe.test.mjs",
     "test:native": "node --test test/native-preflight.test.mjs test/native-adapter.test.mjs test/native-state-map.test.mjs",
+    "stress:dry-run": "node ./bin/ccb-stress.mjs --trials 100",
+    "stress": "node ./bin/ccb-stress.mjs --trials 100 --live --yes --start",
     "check": "npm test && npm run test:native && node ./bin/codex-claude-bridge.mjs --help && node ./bin/codex-claude-bridge.mjs doctor --json"
   },
   "keywords": [

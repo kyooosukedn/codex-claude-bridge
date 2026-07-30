@@ -15,6 +15,7 @@ The classifier reads `ccmux capture` output, strips ANSI, and matches conservati
 - [ARCHITECTURE.md](./docs/ARCHITECTURE.md) — end-to-end mechanism, command taxonomy, classifier precedence, multiline steer implementation, Windows patch.
 - [RELIABILITY.md](./docs/RELIABILITY.md) — honest maturity assessment, what is and is not tested, known limitations, failure modes, suggested next tests.
 - [OPERATIONS.md](./docs/OPERATIONS.md) — install/upgrade, multi-chat sessions, orchestration loop, recovery runbook, troubleshooting, cleanup.
+- [STRESS.md](./docs/STRESS.md) — opt-in P1 stress/fault harness: 100-trial slash-then-prompt run, deterministic crash-recovery + 3-session isolation tests, exact commands, artifacts, honest limitations.
 
 ## Maturity
 

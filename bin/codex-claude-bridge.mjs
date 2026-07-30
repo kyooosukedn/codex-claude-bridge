@@ -15,10 +15,16 @@ import {
   stripAnsi as stripAnsiLib,
 } from "../lib/pane.mjs";
 import { buildSteerPayload, countLines } from "../lib/steer.mjs";
-import { awaitReadyState, paneSignature } from "../lib/readiness.mjs";
+import {
+  awaitIdleBaseline,
+  awaitReadyState,
+  isBaselineInjectable,
+  paneSignature,
+} from "../lib/readiness.mjs";
 import { coordinateInjection } from "../lib/session-coordinator.mjs";
 import { createTransport } from "../lib/transport.mjs";
 import { createCommandJournal } from "../lib/command-journal.mjs";
+import { confirmSlashDelivery } from "../lib/slash-confirm.mjs";
 
 const DEFAULT_SESSION = "codex-claude";
 const DEFAULT_TIMEOUT_MS = 180000;
@@ -78,7 +84,7 @@ Usage:
   ccb start [--session NAME] [--cwd DIR] [--model MODEL] [--effort LEVEL] [--safe-permissions]
   ccb send [--session NAME] [--cwd DIR] [--timeout-ms MS] [--startup-wait-ms MS] "prompt"
   ccb type [--session NAME] [--enter] "raw message"
-  ccb slash [--session NAME] [--ready-timeout-ms MS] [--no-wait] "command"
+  ccb slash [--session NAME] [--idle-timeout-ms MS] [--ready-timeout-ms MS] [--no-wait] "command"
   ccb steer [--session NAME] "message"
   ccb commands [--session NAME] [--json]
   ccb command-status ID [--json]
@@ -411,7 +417,35 @@ function parseCcmuxTerminal(stdout, jobId, session) {
   return terminal;
 }
 
-async function observePaneInjection({
+// Active processing states that prove a submitted prompt was accepted and is
+// being worked on. Used by observePaneInjection as a delivery signal. The pane
+// classifier finds the spinner within a 40-line window (SPINNER_SCAN_LINES),
+// but the tail signature only sees the bottom 12 lines — so a long/wrapped
+// prompt, whose spinner sits above a static footer, can leave the tail
+// byte-identical to the idle baseline and defeat the signature check. Watching
+// for a transition into one of these states closes that gap.
+const INJECTION_OBSERVED_STATES = new Set([
+  "thinking",
+  "needs_input",
+  "permission_prompt",
+]);
+
+// Confirms a prompt reached the pane by watching for a re-render of the tail OR
+// a transition from a quiescent baseline into an active processing state.
+//
+// The tail check alone is a FALSE NEGATIVE on long/wrapped prompts: the
+// submitted text and its spinner render ABOVE the static footer that anchors the
+// bottom 12 lines, so paneSignature() stays equal to the idle baseline even
+// though the pane is clearly "thinking" (the manual `inspect` proof for
+// CCB100J30B-027). The state-transition path uses exactly that evidence.
+//
+// At-most-once is preserved: the transition signal is gated on a QUIESCENT
+// (idle) baseline, so a stale or already-busy pane can never confirm delivery
+// this way — only a genuine idle→active transition counts, never arbitrary pane
+// change. The signature path is unchanged, and an unobserved injection is still
+// ack="uncertain", safeToRetry=false: only the observed/uncertain boundary
+// moves, never the retry policy.
+export async function observePaneInjection({
   session,
   baseline,
   timeoutMs = 5000,
@@ -422,11 +456,27 @@ async function observePaneInjection({
 }) {
   const start = now();
   const baselineSig = paneSignature(baseline);
+  // Reuse the canonical pre-injection quiescent rule (idle, or a done marker
+  // resting on a truly idle empty prompt + footer with no spinner) so a
+  // quiescent done baseline can also use the idle→active delivery proof.
+  const baselineQuiescent = isBaselineInjectable(baseline).injectable;
   do {
     const pane = capture(session, 80);
     const state = classifyPane(pane).state;
     if (paneSignature(pane) !== baselineSig) {
       return { observed: true, reason: state === "thinking" ? "thinking" : "pane-changed", state };
+    }
+    // Wrapped/long prompts can keep the bottom 12 lines byte-identical to an
+    // idle baseline while the spinner (delivery proof) renders higher in the
+    // pane, within the classifier's 40-line scan window. A transition from a
+    // quiescent baseline into an active state is direct, specific evidence the
+    // injection landed — not arbitrary change.
+    if (baselineQuiescent && INJECTION_OBSERVED_STATES.has(state)) {
+      return {
+        observed: true,
+        reason: state === "thinking" ? "thinking" : "state-transition",
+        state,
+      };
     }
     if (now() - start >= timeoutMs) break;
     await wait(intervalMs);
@@ -450,6 +500,8 @@ function defaultCommandDeps() {
       ]),
     observe: observePaneInjection,
     enterText,
+    sendEnter: (session) => key(session, ["Enter"]),
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     steerMessage,
     modeReadyBarrier,
     now: () => new Date(),
@@ -530,6 +582,24 @@ export async function executeCoordinatedSlash({
         DEFAULT_MODE_READY_TIMEOUT_MS,
         "ready-timeout-ms",
       );
+  // Pre-injection idle baseline budget. Defaults to the post-injection barrier
+  // budget so long stop hooks (which keep the pane "thinking" past ccmux's
+  // terminal "done") are tolerated with one knob. Live stress passes this from
+  // --ready-timeout-ms via the harness; isolation inherits the same config.
+  const idleTimeoutMs = noWait
+    ? 0
+    : parsePositiveInt(
+        opts["idle-timeout-ms"],
+        readyTimeoutMs,
+        "idle-timeout-ms",
+      );
+
+  // Closure-local record of the last pre-injection baseline gate result. The
+  // gate runs INSIDE captureBaseline (under the per-session lock), so when the
+  // coordinator returns "not-injected" we can distinguish "pane stayed busy"
+  // (baseline-not-idle) from "ccmux capture itself failed"
+  // (baseline-capture-failed) without changing coordinator return semantics.
+  let baselineGate = null;
   const coordinated = await deps.coordinateInjection({
     session,
     commandId,
@@ -537,7 +607,31 @@ export async function executeCoordinatedSlash({
     pid: process.pid,
     maxPreWriteAttempts: 1,
     now: deps.now,
-    captureBaseline: () => (noWait ? "" : deps.capture(session)),
+    captureBaseline: async () => {
+      if (noWait) return "";
+      // Confirmed-injectable baseline before any transport write. A mode-
+      // changing slash must never be typed into a thinking / needs_input /
+      // permission / unknown pane. The poll happens under the lock so two
+      // same-session slashes still serialize. On timeout we throw, which the
+      // coordinator treats as a pre-write baseline failure: no enterText, lock
+      // released, journal records not-injected, safeToRetry true.
+      const gate = await awaitIdleBaseline({
+        read: () => deps.capture(session),
+        timeoutMs: idleTimeoutMs,
+        intervalMs: DEFAULT_MODE_READY_INTERVAL_MS,
+        now: deps.now,
+        sleep: deps.sleep,
+      });
+      baselineGate = gate;
+      if (!gate.idle) {
+        const err = new Error(
+          `pre-injection idle baseline not reached (reason=${gate.reason}, state=${gate.state})`,
+        );
+        err.ccbBaselineNotIdle = true;
+        throw err;
+      }
+      return gate.tail;
+    },
     inject: async ({ baseline }) => {
       const delivered = deps.enterText(session, text, true);
       const injectedAt = deps.now().toISOString();
@@ -547,10 +641,33 @@ export async function executeCoordinatedSlash({
           command: text,
           commandId,
           injectedAt,
-          readiness: { waited: false, ready: null, reason: "skipped" },
+          readiness: {
+            waited: false,
+            ready: null,
+            reason: "skipped",
+            // Conservative: never send a confirmation Enter without observing
+            // the pane. no-wait callers opt out of delivery confirmation.
+            confirmation: { confirmSent: false, reason: "no-wait", attempts: 0 },
+          },
           exitCode: 0,
         };
       }
+      // Bounded, guarded confirmation for Claude Code slash autocomplete: the
+      // first Enter after pasting a slash only accepts the suggestion, leaving
+      // the command staged. Send ONE additional Enter ONLY when the bottom
+      // active input still contains exactly the submitted command. Never
+      // double-Enter blindly. Skipped when sendEnter is unavailable so the
+      // baseline lock/journal/readiness semantics are preserved unchanged.
+      const useConfirm = typeof deps.sendEnter === "function";
+      const confirmation = useConfirm
+        ? await confirmSlashDelivery({
+            text,
+            capture: () => deps.capture(session),
+            sendEnter: () => deps.sendEnter(session),
+            now: deps.now,
+            sleep: deps.sleep,
+          })
+        : { confirmSent: false, reason: "sendEnter-unavailable", attempts: 0 };
       const barrier = await deps.modeReadyBarrier(
         session,
         baseline,
@@ -571,6 +688,7 @@ export async function executeCoordinatedSlash({
           waitedMs: barrier.waitedMs,
           attempts: barrier.attempts,
           evidence: barrier.evidence,
+          confirmation,
         },
         exitCode: barrier.ready ? 0 : SLASH_NOT_READY_EXIT,
       };
@@ -583,6 +701,33 @@ export async function executeCoordinatedSlash({
   });
   if (coordinated.ack !== "injected") {
     if (coordinated.ack === "not-injected") {
+      // Pre-injection idle timeout: the pane never reached an injectable state.
+      // No enterText was issued. Distinguish from a raw capture failure so
+      // reports can tell "busy pane" apart from "ccmux capture broken".
+      if (baselineGate && !baselineGate.idle) {
+        return {
+          body: {
+            command: text,
+            commandId,
+            preInjection: baselineGate,
+            readiness: {
+              waited: true,
+              ready: false,
+              state: baselineGate.state,
+              phase: "pre-injection",
+              reason:
+                baselineGate.reason === "capture-error"
+                  ? "baseline-capture-failed"
+                  : "baseline-not-idle",
+              waitedMs: baselineGate.waitedMs,
+              attempts: baselineGate.attempts,
+              evidence: baselineGate.evidence,
+            },
+            coordinator: coordinated,
+          },
+          exitCode: SLASH_BASELINE_FAILED_EXIT,
+        };
+      }
       return {
         body: {
           command: text,
@@ -590,6 +735,7 @@ export async function executeCoordinatedSlash({
           readiness: {
             waited: true,
             ready: false,
+            phase: "pre-injection",
             reason: "baseline-capture-failed",
             evidence: { captureError: coordinated.error },
           },

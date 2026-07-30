@@ -389,24 +389,59 @@ process.stdout.write(JSON.stringify(result));
   );
 
   const winners = results.filter((r) => r.acquired);
-  assert.equal(winners.length, 1, `expected one winner, got ${winners.length}`);
+  // Core invariant: exactly one contender ends up owning the canonical lock.
+  assert.equal(winners.length, 1, `expected exactly one winner, got ${winners.length}`);
   const winner = winners[0];
-  assert.equal(winner.recovered, true);
-  assert.equal(winner.priorPhase, "pre-write");
 
-  // Canonical metadata equals the O_EXCL winner — not any rename-only contender.
+  // Two valid fresh-ownership outcomes — both arise SOLELY from winning a fresh
+  // O_EXCL on the canonical path, never from the rename-only claim:
+  //   - "recovered-dead-owner": this contender claimed the dead generation,
+  //     unlinked it, and won the fresh O_EXCL itself.
+  //   - "created": a DIFFERENT contender claimed + unlinked the dead generation,
+  //     and this contender raced its INITIAL O_EXCL through the gap before the
+  //     claim winner's fresh O_EXCL, becoming the sole fresh owner. That is
+  //     allowed by design — the rename-only claim never confers ownership.
+  if (winner.reason === "recovered-dead-owner") {
+    assert.equal(winner.recovered, true);
+    assert.equal(winner.priorPhase, "pre-write");
+    assert.ok(winner.quarantinePath, "recovered winner reports the tombstone it set");
+    assert.notEqual(winner.quarantinePath, canonical);
+  } else if (winner.reason === "created") {
+    assert.equal(winner.recovered, false);
+    assert.equal(winner.priorPhase, null);
+    assert.equal(winner.quarantinePath, null);
+  } else {
+    assert.fail(`unexpected winner reason: ${winner.reason}`);
+  }
+
+  // Canonical metadata always equals the O_EXCL winner — never a rename-only
+  // contender.
   const canonicalRecord = await store.read(canonical);
   assert.equal(canonicalRecord.ownerToken, winner.ownerToken);
   assert.equal(canonicalRecord.commandId, winner.commandId);
 
-  // No contender reports ownership merely because it won the rename: any
-  // contender that entered recovery (set a quarantinePath) but did not win the
-  // fresh O_EXCL reports contended, never acquired.
+  // No non-winner reports ownership. (winners.length === 1 already guarantees
+  // this; spell it out for clarity.)
+  for (const r of results) {
+    if (r !== winner) assert.equal(r.acquired, false);
+  }
+
+  // A contender that entered recovery (set a quarantinePath) but did NOT win the
+  // fresh O_EXCL reports contended, never acquired. In the "created" race this
+  // includes the claim winner itself, whose fresh O_EXCL lost to the racer.
   for (const r of results) {
     if (r.quarantinePath && !r.acquired) {
       assert.equal(r.reason, "contended");
     }
   }
+
+  // Deterministic quarantine evidence: exactly one contender hard-linked the
+  // dead generation into the tombstone derived from the dead owner's token, and
+  // it holds the dead generation regardless of who won the fresh O_EXCL.
+  const tombstone = await store.read(path.join(dir, "race.lock.dead.quarantine"));
+  assert.equal(tombstone.ownerToken, "dead");
+  assert.equal(tombstone.commandId, "dead-cmd");
+  assert.equal(tombstone.phase, "pre-write");
 
   await fs.rm(dir, { recursive: true, force: true });
 });

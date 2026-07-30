@@ -4,6 +4,8 @@ How to install, drive, and recover `codex-claude-bridge` (`ccb`) in practice. Th
 
 Every command below is read-only unless it is explicitly marked as mutating. The mutating commands are `send`, `type`, `slash`, `steer`, `approve`, `deny`, `key`, `choose`, `enter`, `escape`, `interrupt`, `kill`, and the implicit start that happens the first time you target a new `--session` name.
 
+> **Acceptance testing:** the opt-in P1 stress/fault harness (100-trial slash-then-prompt run, deterministic crash recovery, 3-session isolation) lives in [STRESS.md](./STRESS.md). `npm test` runs only the deterministic parts; the live run never launches Claude unless you pass `--live --yes`.
+
 ## Install, upgrade, doctor
 
 ### Prerequisites
@@ -130,6 +132,10 @@ The loop below is what `ccb` is shaped for. It is a request/response cycle with 
 | Send a prompt and block until the turn completes               | `ccb send`                                                                         |
 | Send a prompt and continue immediately                         | `ccb type` (single-line) or `ccb steer` (multiline)                                |
 | Send a slash command (`/cost`, `/release-notes`)               | `ccb slash`                                                                        |
+
+> **Slash autocomplete (Claude Code v2.1.218+).** The first `Enter` after pasting a slash only accepts the autocomplete suggestion, leaving the command staged. In waited mode `ccb slash` sends a bounded, guarded confirmation `Enter` — only when the bottom active input still contains exactly the submitted command (ANSI/NBSP normalized), at most once. See [RELIABILITY.md](./RELIABILITY.md#readiness-barrier-after-slash-commands). `--no-wait` skips it conservatively.
+
+> **Pre-injection idle baseline.** A mode-changing `ccb slash` (waited) is only injected once the pane is injectable under the lock: state `idle`, or state `done` only when classifier evidence proves an empty active prompt + footer with no spinner (a bare done marker is rejected). A busy pane yields a not-injected result (exit 7, `readiness.phase: "pre-injection"`), distinct from a post-injection readiness timeout (exit 6). Tune the budget with `--idle-timeout-ms` (defaults to `--ready-timeout-ms`). See [RELIABILITY.md](./RELIABILITY.md#pre-injection-idle-baseline).
 | Inject a long or multiline steering message mid-turn           | `ccb steer` (the only path that preserves embedded newlines)                       |
 | Find out what state the pane is in                             | `ccb inspect`                                                                      |
 | Block until the state changes or a budget expires              | `ccb watch`                                                                        |
